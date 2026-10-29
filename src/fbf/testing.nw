@@ -940,6 +940,9 @@ the tests below check the result, not the mechanism: if a new copy of
 def _collect(self, obj, parent=None):
     if isinstance(obj, dict):
         obj = {key: redact_secret(key, value) for key, value in obj.items()}
+        if parent != "relationships":
+            obj = {key: self._structured_free_text(key, value)
+                   for key, value in obj.items()}
         if is_person_resource(obj):
             return {key: self._collect(
                         value, "user" if key == "attributes" else str(key).lower())
@@ -999,6 +1002,90 @@ def test_recordings_replace_fbfs_own_fields(scrubber):
   assert email.endswith("@example.invalid")
   activity = scrubbed["included"][-1]["attributes"]
   assert activity == {"title": "Peer review 1", "name": "Peer review 1"}
+@
+
+\subsubsection{Free text that is not a string}
+
+[[vcr_support]] replaces a free-text field only when its value is a string.
+FBF's reflections are not: their [[body]] is a Quill Delta, the rich-text
+format of FBF's editor,
+\begin{center}
+[[{"ops": [{"insert": "First line\n"}, {"insert": {"emoji": ...}}]}]]
+\end{center}
+so [[vcr_support]] walks into it, finds only the keys [[ops]] and
+[[insert]], which name no free text, and records the prose as it is.
+Nor does the scan after the run catch it, since prose has no shape that a
+pattern could find.
+We therefore replace a free-text field whose value is an object or a list
+wholesale, and note its strings as originals, as [[vcr_support]] does for a
+string.
+A Delta becomes a Delta again, with the placeholder as its only text: the
+drift comparison then still sees [[ops]] and [[insert]], and code that reads
+the text of a Delta reads the placeholder.
+Anything else becomes the placeholder, in a list if it was a list.
+
+Relationships are the exception.
+In JSON:API, [[comments]] and [[note]] are also names of relationships,
+whose values are objects with [[data]] and [[links]]; those name resources
+rather than hold text, and the client follows them, so the rule leaves the
+[[relationships]] object alone.
+<<scrubbing for FBF>>=
+def strings_in(value):
+    """Yield the strings anywhere in `value`."""
+    if isinstance(value, str):
+        yield value
+    elif isinstance(value, dict):
+        for item in value.values():
+            yield from strings_in(item)
+    elif isinstance(value, list):
+        for item in value:
+            yield from strings_in(item)
+
+
+def text_placeholder(value):
+    """Return the placeholder for the free text held in `value`."""
+    if isinstance(value, dict) and "ops" in value:
+        return {"ops": [{"insert": vcr_support.FREE_TEXT_PLACEHOLDER}]}
+    if isinstance(value, list):
+        return [vcr_support.FREE_TEXT_PLACEHOLDER]
+    return vcr_support.FREE_TEXT_PLACEHOLDER
+<<[[FBFPseudonymizer]] methods>>=
+def _structured_free_text(self, key, value):
+    """Return the placeholder for free text in an object or a list."""
+    name = str(key).lower()
+    if (name not in self.free_text_keys or name in self.keep_text
+            or not isinstance(value, (dict, list))):
+        return value
+    self._log(*strings_in(value))
+    return text_placeholder(value)
+@
+
+Let's verify it on a reflection with a Delta body and on a comment whose
+body is a list, both made up, and check that a relationship named like a
+free-text field keeps its link.
+<<test functions>>=
+REFLECTIONS = {"data": [
+  {"type": "reflections", "id": "r1",
+   "attributes": {"body": {"ops": [
+     {"insert": "I learnt a lot from Bo Berg.\n"},
+     {"insert": {"emoji": {"name": "smile"}}}]}},
+   "relationships": {"comments": {"links": {
+     "related": "/v1/reflections/r1/comments"}}}},
+  {"type": "comments", "id": "c1",
+   "attributes": {"body": ["Second", "thoughts on Bo Berg"]}},
+]}
+
+def test_recordings_replace_free_text_that_is_not_a_string(scrubber):
+  scrubbed = scrubber.scrub_json(json.loads(json.dumps(REFLECTIONS)))
+  text = json.dumps(scrubbed)
+  for value in ("learnt", "Bo Berg", "smile", "Second"):
+    assert value not in text, value
+  reflection, comment = scrubbed["data"]
+  assert reflection["attributes"]["body"] == {
+    "ops": [{"insert": "[redacted free text]"}]}
+  assert comment["attributes"]["body"] == ["[redacted free text]"]
+  assert reflection["relationships"]["comments"]["links"]["related"] \
+    == "/v1/reflections/r1/comments"
 @
 
 \subsubsection{Secrets in URLs}
