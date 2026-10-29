@@ -954,6 +954,7 @@ if len(actors) > len(student_of):
           "participants are not students in Canvas, left out",
           file=sys.stderr)
 <<warn about progresses set aside>>
+<<warn about grades not fetched>>
 graded = [row for row in rows if row.overall is not None]
 unexplained = sum(1 for row in graded
                   if not adds_up(row.facets, row.overall))
@@ -974,6 +975,21 @@ set_aside = (sum(1 for progress in progresses
 if set_aside:
     print(f"{assignment.name}: {set_aside} progresses set aside for "
           "students with more than one", file=sys.stderr)
+@
+
+A grade that FBF sent but did not give back by its id would show as
+published without a grade sent, which looks like a failed sending.
+That would happen if [[v1/lti/grades]] returned fewer grades than the ids
+asked for in one request; it does not now (50 ids gave 50 grades, three
+times over), but the count would show if it started.
+
+<<warn about grades not fetched>>=
+not_fetched = sum(1 for progress in progresses
+                  if related_id(progress, "latest-grade") is not None
+                  and related_id(progress, "latest-grade") not in sent)
+if not_fetched:
+    print(f"{assignment.name}: {not_fetched} grades sent could not be "
+          "fetched", file=sys.stderr)
 @
 
 
@@ -1144,7 +1160,7 @@ The course has three students and a teaching assistant.
 Ada has a published grade, which Canvas has as 5 points instead of 6, and
 a second, empty, FBF identity; Bo has an unpublished grade whose breakdown
 does not add up; Cy never opened the activity; Di opened it and did
-nothing.
+nothing; Bo and Di point to grades sent that FBF does not return.
 Two assignments use the activity, and a third was not opened.
 
 <<test functions>>=
@@ -1156,8 +1172,9 @@ def command_world():
   fbf = FakeFBF(
     [progress("a1", published="2026-10-01", grade="g1"),
      progress("a1b", overall=0.0, grades={}, kind="people"),
-     progress("a2", overall=50.0, grades={"t1": {"viewed": 40}}),
-     progress("a4", overall=0.0, grades={}),
+     progress("a2", overall=50.0, grades={"t1": {"viewed": 40}},
+              grade="gone2"),
+     progress("a4", overall=0.0, grades={}, grade="gone"),
      progress("ta")],
     {"a1": ["ada@example.com"], "a1b": ["ada@example.com"],
      "a2": ["bo@example.com"], "a4": ["di@example.com"],
@@ -1203,6 +1220,7 @@ def test_collect_progress_fetches_once_and_warns_with_counts(capsys):
   assert err.count("1 progresses set aside") == 2
   assert err.count("1 of 3 breakdowns do not add up") == 2
   assert err.count("Week 3: not opened") == 1
+  assert err.count("2 grades sent could not be fetched") == 2
   assert "@" not in err
 @
 
