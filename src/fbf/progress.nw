@@ -148,9 +148,10 @@ resources, and the command that ties them together.
 @
 
 <<test [[progress.py]]>>=
-from types import SimpleNamespace
-
 import pytest
+from canvasapi.assignment import Assignment as CanvasAssignment
+from canvasapi.submission import Submission
+from canvasapi.user import User
 
 from fbf.progress import *
 from fbf.schema import SchemaError
@@ -427,11 +428,14 @@ field, an address that matches nobody (an old one, say) does not stop the
 next from matching, and an actor that is not a student (here a teacher)
 is not matched.
 
+The students are [[canvasapi]] users, built from attributes as Canvas
+sends them, so that a field we read under the wrong name fails here.
+
 <<test functions>>=
-STUDENTS = [SimpleNamespace(id=1, login_id="ada@example.com",
-                            email="ada@example.com"),
-            SimpleNamespace(id=2, login_id="Bo@Example.com", email=None),
-            SimpleNamespace(id=3, login_id=None, email="cy@example.com")]
+STUDENTS = [User(None, {"id": 1, "login_id": "ada@example.com",
+                        "email": "ada@example.com"}),
+            User(None, {"id": 2, "login_id": "Bo@Example.com"}),
+            User(None, {"id": 3, "email": "cy@example.com"})]
 
 def test_match_actors_by_email_or_login():
   matched = match_actors({"a1": {"Ada@Example.com"},
@@ -567,7 +571,8 @@ grade FBF has not sent, and one without progress; and a teacher, who has
 progress but is not a student.
 
 <<test functions>>=
-ASSIGNMENT = SimpleNamespace(name="Week 1", points_possible=10)
+ASSIGNMENT = CanvasAssignment(None, {"id": 7, "name": "Week 1",
+                                      "points_possible": 10, "course_id": 5})
 SENT = {"g1": {"type": "lti/grade", "id": "g1",
                "attributes": {"grade": 0.6, "result-status": "success"}}}
 
@@ -905,10 +910,11 @@ counts as a student.
 <<test functions>>=
 def test_students_only_keeps_student_enrollments():
   def user(id, *types):
-    return SimpleNamespace(id=id, enrollments=[{"type": t} for t in types])
+    return User(None, {"id": id,
+                       "enrollments": [{"type": t} for t in types]})
   users = [user(1, "StudentEnrollment"), user(2, "TaEnrollment"),
            user(3, "TaEnrollment", "StudentEnrollment"), user(4),
-           SimpleNamespace(id=5)]
+           User(None, {"id": 5})]
   assert [u.id for u in students_only(users)] == [1, 3]
 @
 
@@ -1087,9 +1093,6 @@ only by the ids asked for, as FBF does.
 from argparse import Namespace
 import json as jsonlib
 
-from canvasapi.assignment import Assignment as CanvasAssignment
-from canvasapi.submission import Submission
-from canvasapi.user import User
 from fbf.api import FBF
 
 class FakeFBF(FBF):
