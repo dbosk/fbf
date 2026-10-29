@@ -21,13 +21,16 @@ intersection.
 Each extractor declares its names in its own chapter, next to the code that
 reads them, with [[requires]] in a chunk [[<<required names>>]]; the
 build tangles those chunks from all chapters into this module.
+Since tangling from several files joins all chunks of the same name, this
+module's code goes in [[<<schema functions>>]], not in the
+[[<<functions>>]] that every chapter has.
 
 <<[[schema.py]]>>=
 """The FeedbackFruits names that fbf depends on, and checked access."""
 
 REQUIRED = set()
 
-<<functions>>
+<<schema functions>>
 
 <<required names>>
 @
@@ -45,7 +48,7 @@ The chunk starts empty here; every extractor chapter adds its declarations.
 
 <<required names>>=
 # Declarations of the extractor chapters follow.
-<<functions>>=
+<<schema functions>>=
 def requires(kind, attributes=(), relationships=()):
     """Declare that fbf reads these names of the JSON:API type `kind`."""
     REQUIRED.update(f"type {kind} attribute {name}" for name in attributes)
@@ -63,7 +66,7 @@ absent from the resource means that FBF changed, and raises.
 The message points to the recovery procedure, since that is what the reader
 of the error needs next.
 
-<<functions>>=
+<<schema functions>>=
 class SchemaError(Exception):
     """A resource lacks a name that fbf depends on."""
 

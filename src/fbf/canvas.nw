@@ -1,0 +1,125 @@
+\chapter{From Canvas assignments to FBF activities}
+\label{Canvas}
+
+Users think in Canvas terms: a course, an assignment.
+FBF has its own: an LTI course and an activity, each with a UUID.
+This chapter connects the two, so that the commands can take the familiar
+[[canvaslms]] options [[-c]] and [[-a]] and work on the corresponding FBF
+activities.
+
+The connection is the launch URL of the assignment.
+An FBF assignment in Canvas launches
+[[https://api.feedbackfruits.com/v1/lti/launch?code=...]], and the [[code]]
+identifies the FBF \emph{placement} of the activity, that is, where in Canvas
+it sits.
+FBF's placement resource carries the same code and points to the activity.
+So one launch, for any of the selected assignments, gives us a token, and
+the token and the codes give us all the activities without further launches.
+
+<<[[canvas.py]]>>=
+"""Connect Canvas assignments to FeedbackFruits activities."""
+
+<<imports>>
+
+<<functions>>
+@
+
+<<test [[canvas.py]]>>=
+from fbf.canvas import *
+
+<<test functions>>
+@
+
+
+\section{Recognising FBF assignments}
+
+Canvas gives an external-tool assignment an [[external_tool_tag_attributes]]
+dictionary whose [[url]] is the launch URL.
+We take the assignment to be FBF's if that URL is on an FBF host and has a
+[[code]] parameter.
+Matching the host keeps us from picking up another tool that happens to use
+a [[code]] parameter.
+
+<<imports>>=
+import urllib.parse
+<<functions>>=
+def placement_code(assignment):
+    """Return the FBF placement code of a Canvas `assignment`, or `None`."""
+    attributes = getattr(assignment, "external_tool_tag_attributes", None)
+    url = (attributes or {}).get("url") or ""
+    parts = urllib.parse.urlsplit(url)
+    host = parts.hostname or ""
+    if not (host == "feedbackfruits.com" or host.endswith(".feedbackfruits.com")):
+        return None
+    return (urllib.parse.parse_qs(parts.query).get("code") or [None])[0]
+@
+
+Canvas assignments are [[canvasapi]] objects, but only the attribute matters
+here, so a namespace stands in for one.
+
+<<test functions>>=
+from types import SimpleNamespace
+
+def assignment(url):
+  return SimpleNamespace(external_tool_tag_attributes={"url": url})
+
+def test_placement_code():
+  assert placement_code(assignment(
+    "https://api.feedbackfruits.com/v1/lti/launch?code=e8f5")) == "e8f5"
+  assert placement_code(assignment(
+    "https://other.example.com/launch?code=e8f5")) is None
+  assert placement_code(SimpleNamespace()) is None
+@
+
+
+\section{One launch for all}
+
+We launch with the first FBF assignment among those selected; any would do,
+since the token is the user's.
+The client gets a [[relaunch]] that repeats the same launch, for when the
+tokens can no longer be refreshed in a long run.
+
+<<imports>>=
+import functools
+from fbf.api import FBF
+from fbf.launch import launch
+<<functions>>=
+def connect(canvas_url, canvas_token, assignments):
+    """Launch FBF through one of the FBF `assignments`; return an `FBF`.
+
+    Returns `None` if none of `assignments` is an FBF assignment.
+    """
+    for assignment in assignments:
+        if placement_code(assignment):
+            relaunch = functools.partial(
+                launch, canvas_url, canvas_token,
+                assignment.course_id, assignment.id)
+            return FBF(relaunch(), relaunch=relaunch)
+    return None
+@
+
+
+\section{Finding the activity}
+
+[[/v1/lti/placements]] accepts [[filter[code]]], and the placement's
+[[placeable]] relationship is the activity.
+A word of caution from experience: FBF ignores filters it does not support
+and then returns \emph{everything}---[[/v1/activities?filter[code]=...]]
+returns all activities.
+So we do not trust the filter but check the code of what comes back.
+Should FBF one day ignore this filter too, we get the right answer more
+slowly instead of a wrong one.
+
+<<imports>>=
+from fbf.schema import attribute, related_id, requires
+<<required names>>=
+requires("lti/placement", attributes=["code"], relationships=["placeable"])
+<<functions>>=
+def activity_id(fbf, code):
+    """Return the id of the FBF activity placed with `code`, or `None`."""
+    placements = fbf.get("v1/lti/placements", **{"filter[code]": code})
+    for placement in placements.resources:
+        if attribute(placement, "code") == code:
+            return related_id(placement, "placeable")
+    return None
+@
