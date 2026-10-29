@@ -205,6 +205,26 @@ def record_mode_of(config):
     return config.getoption("--record-mode") or "none"
 @
 
+Let's verify the refusal by running [[pytest]] with this configuration,
+through the [[pytester]] fixture, on an empty test directory and without a
+key.
+The run must stop before it collects anything, so nothing can reach Canvas
+or FBF.
+[[pytester]] cannot run in its own process a [[pytest]] that exits while it
+configures itself, so this inner run gets a process of its own, and with it
+a copy of [[vcr_support.py]], which the configuration imports from its own
+directory.
+<<test functions>>=
+def test_recording_without_a_key_is_refused(pytester, monkeypatch):
+  monkeypatch.delenv("TEST_PSEUDONYM_KEY", raising=False)
+  pytester.makeconftest(file_text(conftest.__file__))
+  pytester.makepyfile(vcr_support=file_text(conftest.vcr_support.__file__))
+  result = pytester.runpytest_subprocess(
+    "--record-mode=once", "-p", "no:cacheprovider")
+  assert result.ret == 2
+  result.stderr.fnmatch_lines(["*refusing to record*"])
+@
+
 The live recordings hold real people's data, pseudonymized, so they go in a
 private directory outside the repository rather than in the shared temporary
 directory.
