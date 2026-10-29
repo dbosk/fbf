@@ -56,6 +56,10 @@ asset; FBF/Canvas key lists live in `testing.nw`.
   `TEST_PSEUDONYM_KEY="$(secret-tool lookup service fbf key test-pseudonym)"`.
   Never print it. They also need a `canvaslms login`.
 - Cassettes hold a real course's data (pseudonymized) and are gitignored.
+- The scan's originals file (`$XDG_RUNTIME_DIR/vcr-originals-$UID/<hash of
+  the checkout>.txt`, named in the PRIVACY report) only grows. To record
+  afresh, delete it together with `tests/cassettes`; a stale one reports
+  what an earlier scrubber noted.
 - Every type declared with `requires(...)` needs an `@example(kind)` fetcher
   in an `<<example fetchers>>` chunk, or the contract test in `schema.nw`
   fails.

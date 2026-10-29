@@ -890,6 +890,15 @@ class FBFPseudonymizer(vcr_support.Pseudonymizer):
 The pseudonymizer notes every original value it replaced, in a private file
 outside the repository, so that the scan after the run (\cref{Drift}) can
 look for any of them that slipped through elsewhere.
+The file only grows: a recording with [[--record-mode=once]] keeps the
+cassettes it has, and the originals noted for them must stay to be looked
+for.
+So the file belongs to the cassettes, and the two go together: whoever
+deletes the cassettes to record afresh must delete the file too.
+Otherwise the scan looks for what an earlier, perhaps faulty, scrubber
+noted; after we had fixed the scrubber that noted [[true]] and its own
+placeholders (\cref{FreeTextNoted}), the stale file still reported
+thousands of them in a clean recording.
 In replay nothing is written, and any key will do, since nothing is
 pseudonymized.
 The [[vcrpy]] configuration comes from the pseudonymizer, as in
@@ -1886,11 +1895,13 @@ def content_titles(data):
         for item in data:
             yield from content_titles(item)
 <<report the personal data in the recordings>>=
-leaks = leaks_in_recordings(pairs, getattr(config, "_originals_path", None))
+originals_path = getattr(config, "_originals_path", None)
+leaks = leaks_in_recordings(pairs, originals_path)
 if leaks:
     write("PRIVACY: the recordings contain personal data or secrets (values "
           "redacted below). Extend the key lists in testing.nw, delete the "
-          "cassettes, and record again.", red=True)
+          f"cassettes and the originals ({originals_path}), and record "
+          "again.", red=True)
     for path, where, kind, hit in leaks:
         write(f"  {path}:{where}: {kind} {hit}")
     session.exitstatus = 1
