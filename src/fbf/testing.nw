@@ -1257,8 +1257,19 @@ Second, the keywords are free text: they are words of the students' prose,
 and a word can be a name.
 So [[aggregated-keywords]] is a free-text key, and the object is replaced
 wholesale like a Delta (\cref{FreeTextObjects}), keys and all.
+
+The answers to open questions carry the same kind of data, per answer: their
+[[keywords]] are a list of the words that FBF picked out of the answer, each
+with its [[lemma]] and the [[spans]] of the answer where it occurs.
+The second recording found a student's first name there, as a lemma.
+And an answer's [[last-auto-suggestion]] is the feedback that FBF's AI
+suggested on it: generated prose that quotes the question, the model answer
+and the student's answer, as a JSON document in a string; the scrubber
+replaced the parts it knew and left the quotations in the rest.
+Both are free text, replaced wholesale.
 <<scrubbing for FBF>>=
-FBF_FREE_TEXT_KEYS |= {"aggregated-keywords"}
+FBF_FREE_TEXT_KEYS |= {"aggregated-keywords", "keywords",
+                       "last-auto-suggestion"}
 @
 
 Let's verify both with a criterion whose keywords, made up, include
@@ -1276,6 +1287,21 @@ def test_recordings_replace_keywords_whatever_they_are(scrubber):
   assert attributes["aggregated-keywords"] == "[redacted free text]"
   assert attributes["title"] == "Structure"
   assert "Bo Berg" not in json.dumps(scrubbed)
+
+ANSWER = {"data": {
+  "type": "open-answers", "id": "a1",
+  "attributes": {
+    "body": "[redacted free text]",
+    "keywords": [{"lemma": "Bo", "spans": [{"string": "Bo", "start": 4}]}],
+    "last-auto-suggestion": json.dumps(
+      {"feedback": "You wrote that Bo Berg was right.", "score": 1})}}}
+
+def test_recordings_replace_answer_keywords_and_suggestions(scrubber):
+  scrubbed = scrubber.scrub_json(json.loads(json.dumps(ANSWER)))
+  attributes = scrubbed["data"]["attributes"]
+  assert attributes["keywords"] == ["[redacted free text]"]
+  assert attributes["last-auto-suggestion"] == "[redacted free text]"
+  assert "Bo" not in json.dumps(scrubbed)
 
 def test_an_object_with_a_type_that_is_no_string_is_no_resource(scrubber):
   scrubbed = scrubber.scrub_json({"meta": {"type": {"count": 2},
