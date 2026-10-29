@@ -9,6 +9,7 @@ SHELL=		/bin/bash
 
 MODULES+=	init.nw
 MODULES+=	launch.nw
+MODULES+=	api.nw
 
 .PHONY: all
 all: __init__.py ${MODULES:.nw=.tex}

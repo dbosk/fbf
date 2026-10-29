@@ -1,0 +1,346 @@
+\chapter{The FeedbackFruits API}
+\label{API}
+
+With an access token from \cref{Launch} we can use the API that FBF's own web
+app uses.
+This chapter is a thin client for it.
+It knows how FBF speaks---JSON:API over HTTPS with a bearer token---but
+nothing about activities, reviews or grades; that knowledge sits in the
+modules that use it.
+Keeping the client free of domain knowledge makes it the one place where we
+talk to the network, which is also the place the tests record and replay.
+
+\section{What the API looks like}
+
+We learned the API from a browser capture and a few probes.
+\begin{description}
+\item[Format.] Responses follow JSON:API: a top-level [[data]] holding one
+  resource or a list, an optional [[included]] list of related resources,
+  and an optional [[meta]].
+  A resource has a [[type]] (\eg [[progresses]], [[multimedia-tasks]]), an
+  [[id]] (a UUID), [[attributes]] with kebab-case names, and
+  [[relationships]].
+  A relationship holds either [[data]] (the type and id of the related
+  resource) or [[links]] with a [[related]] path to fetch it from, or both.
+\item[Authentication.] The web app sends the token as a cookie together
+  with a CSRF token, but the API accepts [[Authorization: Bearer]] with the
+  same token, and nothing else.
+  We use the header, which makes the client independent of cookies.
+\item[Pagination.] A list request without [[page[number]]] returns the whole
+  list and no [[meta]].
+  The web app asks for pages, and then [[meta]] holds [[page]],
+  [[per-page]], [[total-pages]] and [[total-count]]; pages count from~1, and
+  page~0 is the same as page~1.
+\item[Scope.] The token belongs to the user, not to the launched activity:
+  [[/v1/courses]] lists every FBF course the user is in, and
+  [[/v1/activities]] every activity.
+\item[Renewal.] An access token lives 30~minutes.
+  [[POST /oauth/token]] on the API host with [[grant_type=refresh_token]]
+  gives a new access token and a new refresh token.
+\end{description}
+
+<<[[api.py]]>>=
+"""A thin client for FeedbackFruits' JSON:API."""
+
+<<imports>>
+
+<<constants>>
+
+<<classes>>
+
+<<functions>>
+@
+
+<<test [[api.py]]>>=
+from fbf.api import *
+
+<<test functions>>
+@
+
+
+\section{Paths and URLs}
+
+We address the API with paths such as [[v1/activities/<id>]], and the API
+itself gives us paths in relationship links, such as
+[[/v1/activities/<id>/comments]].
+Joining both kinds onto the API URL with [[urljoin]] treats them alike: a
+leading slash means \enquote{from the host's root}, which is what FBF's links
+mean.
+A full URL passes through unchanged, so a link to another host still works.
+
+<<imports>>=
+import urllib.parse
+<<functions>>=
+def api_url_for(api_url, path):
+    """Return the URL of `path` (relative, absolute or a full URL)."""
+    return urllib.parse.urljoin(api_url.rstrip("/") + "/", path)
+@
+
+<<test functions>>=
+def test_api_url_for_joins_paths_and_links():
+  api = "https://api.example.com"
+  assert api_url_for(api, "v1/users/current") \
+    == "https://api.example.com/v1/users/current"
+  assert api_url_for(api, "/v1/tasks/1/progresses") \
+    == "https://api.example.com/v1/tasks/1/progresses"
+  assert api_url_for(api, "https://other.example.com/x") \
+    == "https://other.example.com/x"
+@
+
+
+\section{Resources and documents}
+
+A JSON:API document is just nested dictionaries, and we could hand those to
+the callers.
+But every caller needs the same two things: to treat [[data]] uniformly
+whether it is one resource or a list, and to find a related resource in
+[[included]] by its type and id.
+A small [[Document]] class does both once.
+We keep the resources themselves as plain dictionaries, since the callers
+read them through the schema checks of the extractors, not through methods
+here.
+
+The [[included]] index is keyed by [[(type, id)]] because ids are unique
+only within a type in JSON:API.
+
+<<classes>>=
+class Document:
+    """A JSON:API response document."""
+
+    def __init__(self, document):
+        self.raw = document
+        data = document.get("data")
+        self.is_list = isinstance(data, list)
+        self.resources = data if self.is_list else [data] if data else []
+        self.included = index_resources(document.get("included", []))
+        self.meta = document.get("meta") or {}
+
+    @property
+    def resource(self):
+        """The single resource of the document, `None` if there is none."""
+        return self.resources[0] if self.resources else None
+<<functions>>=
+def index_resources(resources):
+    """Return a dictionary of `resources` keyed by `(type, id)`."""
+    return {(r["type"], r["id"]): r for r in resources}
+@
+
+<<test functions>>=
+def test_document_treats_single_and_list_alike():
+  one = Document({"data": {"type": "users", "id": "1"}})
+  many = Document({"data": [{"type": "users", "id": "1"},
+                            {"type": "users", "id": "2"}]})
+  empty = Document({"data": []})
+  assert not one.is_list and one.resource["id"] == "1"
+  assert many.is_list and [r["id"] for r in many.resources] == ["1", "2"]
+  assert empty.resources == [] and empty.resource is None
+
+def test_document_indexes_included_by_type_and_id():
+  doc = Document({"data": [],
+                  "included": [{"type": "users", "id": "1"},
+                               {"type": "emails", "id": "1"}]})
+  assert doc.included[("users", "1")]["type"] == "users"
+  assert doc.included[("emails", "1")]["type"] == "emails"
+@
+
+\subsection{Merging pages}
+
+Since a list request without a page number returns the whole list, we
+normally get one page.
+We still merge pages when the response says there are more, in case FBF
+starts paginating by default; otherwise we would silently get only the first
+ten items.
+Merging concatenates the data and unites the included resources.
+
+<<functions>>=
+def merge_pages(documents):
+    """Merge JSON:API list documents (pages) into one document."""
+    data, included = [], {}
+    for document in documents:
+        data.extend(document.get("data") or [])
+        included.update(index_resources(document.get("included", [])))
+    return {"data": data, "included": list(included.values())}
+@
+
+<<test functions>>=
+def test_merge_pages_concatenates_and_dedups_included():
+  user = {"type": "users", "id": "u"}
+  pages = [{"data": [{"type": "progresses", "id": "1"}], "included": [user]},
+           {"data": [{"type": "progresses", "id": "2"}], "included": [user]}]
+  merged = Document(merge_pages(pages))
+  assert [r["id"] for r in merged.resources] == ["1", "2"]
+  assert list(merged.included) == [("users", "u")]
+@
+
+Whether more pages remain is a question for the [[meta]] of the last page.
+Page~0 counts as page~1, hence the [[max]].
+
+<<functions>>=
+def next_page(meta):
+    """Return the next page number after a page with `meta`, or `None`."""
+    if not meta or "total-pages" not in meta:
+        return None
+    page = max(int(meta.get("page") or 1), 1)
+    return page + 1 if page < int(meta["total-pages"]) else None
+@
+
+<<test functions>>=
+def test_next_page():
+  assert next_page({}) is None
+  assert next_page({"page": 0, "total-pages": 3}) == 2
+  assert next_page({"page": 2, "total-pages": 3}) == 3
+  assert next_page({"page": 3, "total-pages": 3}) is None
+@
+
+
+\section{The client}
+
+The client holds the tokens and a [[requests]] session.
+Besides the tokens it can take a [[relaunch]] function, which returns a new
+[[FBFLogin]], for when renewal fails; usually that is a [[launch]] with the
+arguments of the first one.
+
+<<imports>>=
+import requests
+<<classes>>=
+class FBF:
+    """A client for the FeedbackFruits API.
+
+    `login` is an `FBFLogin` from `fbf.launch.launch`.  `relaunch`, if given,
+    is a function returning a new `FBFLogin`, used when the tokens expire and
+    cannot be refreshed.
+    """
+
+    def __init__(self, login, relaunch=None, session=None):
+        self.login = login
+        self.relaunch = relaunch
+        self.session = session or requests.Session()
+
+    <<FBF methods>>
+@
+
+\subsection{Errors}
+
+A failed request raises [[APIError]] with the status and the path, never
+the response body: bodies may name students.
+
+<<classes>>=
+class APIError(Exception):
+    """An FBF API request failed."""
+
+    def __init__(self, status, method, url):
+        self.status = status
+        path = urllib.parse.urlsplit(url).path
+        super().__init__(f"{method} {path}: HTTP {status}")
+@
+
+\subsection{Requests and renewal}
+
+Every request goes through [[request]].
+On a [[401]] it renews the tokens once and repeats the request; a second
+[[401]] is an error, since then the new token is refused too and repeating
+would loop.
+That way callers never see the 30-minute expiry.
+
+<<constants>>=
+JSONAPI_ACCEPT = "application/vnd.api+json"
+<<FBF methods>>=
+def request(self, method, path, **kwargs):
+    """Send a request to `path` and return the `requests` response."""
+    url = api_url_for(self.login.api_url, path)
+    response = self._send(method, url, **kwargs)
+    if response.status_code == 401:
+        self.renew()
+        response = self._send(method, url, **kwargs)
+    if not response.ok:
+        raise APIError(response.status_code, method, url)
+    return response
+
+def _send(self, method, url, **kwargs):
+    headers = {"Authorization": f"Bearer {self.login.access_token}",
+               "Accept": JSONAPI_ACCEPT}
+    headers.update(kwargs.pop("headers", {}))
+    return self.session.request(method, url, headers=headers, **kwargs)
+@
+
+Renewal first tries the refresh token, which costs one request, and falls
+back on a new launch, which costs half a dozen but needs only the Canvas
+token.
+The refresh rotates the refresh token too, so we keep both new tokens.
+
+<<constants>>=
+TOKEN_PATH = "/oauth/token"
+TOKEN_CLIENT_ID = "FeedbackFruits"
+<<FBF methods>>=
+def renew(self):
+    """Get new tokens: refresh them, or else launch again."""
+    if self.login.refresh_token:
+        response = self.session.post(
+            api_url_for(self.login.api_url, TOKEN_PATH),
+            data={"grant_type": "refresh_token",
+                  "refresh_token": self.login.refresh_token,
+                  "client_id": TOKEN_CLIENT_ID})
+        if response.ok:
+            tokens = response.json()
+            self.login.access_token = tokens["access_token"]
+            self.login.refresh_token = tokens.get(
+                "refresh_token", self.login.refresh_token)
+            return
+    if not self.relaunch:
+        raise APIError(401, "POST", api_url_for(self.login.api_url,
+                                                TOKEN_PATH))
+    self.login = self.relaunch()
+@
+
+\subsection{Getting documents}
+
+[[get]] returns a [[Document]] with all pages merged, as discussed above.
+The [[params]] are JSON:API query parameters such as
+[[{"include": "user", "filter[id]": "a,b"}]].
+
+<<FBF methods>>=
+def get(self, path, **params):
+    """Return the `Document` at `path`, all pages merged."""
+    document = self.request("GET", path, params=params).json()
+    if not isinstance(document.get("data"), list):
+        return Document(document)
+    pages = [document]
+    page = next_page(document.get("meta"))
+    while page:
+        params["page[number]"] = page
+        pages.append(self.request("GET", path, params=params).json())
+        page = next_page(pages[-1].get("meta"))
+    return Document(merge_pages(pages))
+@
+
+\subsection{Following relationships}
+
+The data we want is spread over related resources: an activity has tasks, a
+task has progresses, a progress has an actor.
+[[related]] follows a relationship of a resource.
+It prefers the [[data]] reference when the resource is already in an
+[[included]] list we hold, which saves a request, and otherwise fetches the
+[[related]] link.
+When neither exists, the relationship is empty and we return [[None]].
+
+<<FBF methods>>=
+def related(self, resource, name, included=None):
+    """Return the resources related to `resource` through `name`.
+
+    Returns a list for to-many relationships, a resource or `None` for
+    to-one.  `included` is an index from `Document.included` to look in
+    before fetching.
+    """
+    relationship = resource.get("relationships", {}).get(name) or {}
+    data = relationship.get("data")
+    references = data if isinstance(data, list) else [data] if data else []
+    if included is not None and references and all(
+            (r["type"], r["id"]) in included for r in references):
+        found = [included[(r["type"], r["id"])] for r in references]
+        return found if isinstance(data, list) else found[0]
+    link = (relationship.get("links") or {}).get("related")
+    if link:
+        document = self.get(link)
+        return document.resources if document.is_list else document.resource
+    return [] if isinstance(data, list) else None
+@
