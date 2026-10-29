@@ -224,16 +224,40 @@ class FBF:
 
 A failed request raises [[APIError]] with the status and the path, never
 the response body: bodies may name students.
+Even the path can identify someone: [[v1/people/<id>/emails]] carries a
+person's FBF id, and the message ends up on the terminal or in a log.
+So the message shows the path with its ids replaced by [[{id}]], which
+still says which endpoint failed; the full URL stays available in the
+[[url]] attribute for a debugger.
 
+<<constants>>=
+ID_IN_PATH = re.compile(
+    r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
+    re.IGNORECASE)
+<<imports>>=
+import re
 <<classes>>=
 class APIError(Exception):
-    """An FBF API request failed."""
+    """An FBF API request failed.
+
+    The message shows the path with ids replaced; `url` has the full URL.
+    """
 
     def __init__(self, status, method, url):
         self.status = status
-        path = urllib.parse.urlsplit(url).path
+        self.url = url
+        path = ID_IN_PATH.sub("{id}", urllib.parse.urlsplit(url).path)
         reason = "timed out" if status == "timeout" else f"HTTP {status}"
         super().__init__(f"{method} {path}: {reason}")
+@
+
+<<test functions>>=
+def test_api_error_hides_ids_in_the_message():
+  person = "00000000-0000-4000-8000-0000000000aa"
+  error = APIError(404, "GET",
+                   f"https://api.example.com/v1/people/{person}/emails")
+  assert str(error) == "GET /v1/people/{id}/emails: HTTP 404"
+  assert person in error.url
 @
 
 \subsection{Requests and renewal}
