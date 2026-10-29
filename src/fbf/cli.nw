@@ -27,12 +27,14 @@ Every chapter that provides a command contributes it here.
 
 <<imports>>=
 import fbf.discussions
+import fbf.progress
 import fbf.har
 import fbf.reviews
 <<functions>>=
 def add_subcommands(subp):
     """Add all fbf subcommands to the argparse subparsers `subp`."""
     fbf.discussions.add_command(subp)
+    fbf.progress.add_command(subp)
     fbf.har.add_command(subp)
     fbf.reviews.add_command(subp)
     for parser in subp.choices.values():
