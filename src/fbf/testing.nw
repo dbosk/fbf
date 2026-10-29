@@ -206,9 +206,47 @@ def record_mode_of(config):
     return config.getoption("--record-mode") or "none"
 @
 
-Let's verify the refusal by running [[pytest]] with this configuration,
-through the [[pytester]] fixture, on an empty test directory and without a
-key.
+\subsection{Testing the configuration in inner runs}
+\label{InnerRuns}
+
+Much of this configuration acts on the run as a whole: it refuses to start,
+skips tests, stops the run or fails it at the end.
+We test that by running [[pytest]] itself, with this configuration, on small
+test files of our own, through the [[pytester]] fixture.
+Such an inner run must never reach Canvas or FBF, whatever mode we put it in
+and whatever the machine has stored: [[make test]] runs these tests, and on
+a machine with a [[canvaslms]] login a recording or live inner run would
+otherwise launch for real.
+The inner tests mostly replace the launch fixture, but a renamed fixture
+would quietly undo that.
+So every inner run gets a configuration that cannot log in: we append a
+[[canvas_credentials]] fixture (\cref{TestLaunch}) that finds no
+credentials and notes in the environment that it was asked, which lets a
+test check that an inner run did not even try.
+<<test functions>>=
+INNER_GUARD = """
+
+@pytest.fixture(scope="session")
+def canvas_credentials():
+    \"\"\"An inner run never logs in, whatever this machine has stored.\"\"\"
+    def none_stored():
+        os.environ["FBF_INNER_ASKED_FOR_CREDENTIALS"] = "yes"
+        raise CredentialsMissing("the inner run never logs in")
+    return none_stored
+"""
+
+def make_inner_conftest(pytester, monkeypatch):
+  """Give the inner run this configuration, unable to log in."""
+  monkeypatch.setenv("FBF_INNER_ASKED_FOR_CREDENTIALS", "no")
+  pytester.makeconftest(file_text(conftest.__file__) + INNER_GUARD)
+
+def file_text(path):
+  with open(path, encoding="utf-8") as file:
+    return file.read()
+@
+
+The first inner run checks the refusal to record without a key, on an empty
+test directory.
 The run must stop before it collects anything, so nothing can reach Canvas
 or FBF.
 [[pytester]] cannot run in its own process a [[pytest]] that exits while it
@@ -218,7 +256,7 @@ directory.
 <<test functions>>=
 def test_recording_without_a_key_is_refused(pytester, monkeypatch):
   monkeypatch.delenv("TEST_PSEUDONYM_KEY", raising=False)
-  pytester.makeconftest(file_text(conftest.__file__))
+  make_inner_conftest(pytester, monkeypatch)
   pytester.makepyfile(vcr_support=file_text(conftest.vcr_support.__file__))
   result = pytester.runpytest_subprocess(
     "--record-mode=once", "-p", "no:cacheprovider")
@@ -303,10 +341,10 @@ def pytest_collection_modifyitems(config, items):
             item.add_marker(skip_writes)
 @
 
-Let's verify the rule in each mode, by running [[pytest]] on a small test
-file with this configuration.
-The inner run replaces the launch fixture (\cref{TestLaunch}), so it never
-contacts Canvas, whatever mode it is in.
+Let's verify the rule in each mode, recording included, in an inner run.
+Its tests replace the launch fixture (\cref{TestLaunch}), so that recording
+can go on without a launch; we check that the inner run did not even ask
+for credentials.
 <<test functions>>=
 INNER_TESTS = """
 import pytest
@@ -327,19 +365,17 @@ def test_reads():
   ([], 2, 0),
   (["--live"], 1, 1),
   (["--live", "--live-writes"], 2, 0),
+  (["--record-mode=once"], 1, 1),
 ])
 def test_mutates_tests_reach_fbf_only_with_live_writes(
     pytester, monkeypatch, tmp_path, options, passed, skipped):
   monkeypatch.setenv("TEST_PSEUDONYM_KEY", "a key for the inner run")
-  pytester.makeconftest(file_text(conftest.__file__))
+  make_inner_conftest(pytester, monkeypatch)
   pytester.makepyfile(test_inner=INNER_TESTS)
   result = pytester.runpytest_inprocess(
     *options, f"--live-dir={tmp_path / 'live'}", "-p", "no:cacheprovider")
   result.assert_outcomes(passed=passed, skipped=skipped)
-
-def file_text(path):
-  with open(path, encoding="utf-8") as file:
-    return file.read()
+  assert os.environ["FBF_INNER_ASKED_FOR_CREDENTIALS"] == "no"
 @
 
 
@@ -463,22 +499,11 @@ cassette.
 Let's verify that with a run that records with [[rewrite]] over a cassette
 that is already there, on a machine without credentials: the run must stop
 with an error, and the cassette must still be there.
-The inner run gets its credentials from a fixture that finds none, whatever
-this machine has stored, and notes in the environment that it was asked.
+The inner run has no credentials (\cref{InnerRuns}), and must have asked
+for them.
 <<test functions>>=
 REWRITE_TESTS = """
-import os
-
 import pytest
-
-import conftest
-
-@pytest.fixture(scope="session")
-def canvas_credentials():
-  def none_stored():
-    os.environ["FBF_INNER_ASKED_FOR_CREDENTIALS"] = "yes"
-    raise conftest.CredentialsMissing("the inner run has no login")
-  return none_stored
 
 @pytest.mark.vcr
 def test_uses_fbf(fbf):
@@ -488,8 +513,7 @@ def test_uses_fbf(fbf):
 def test_a_rewrite_without_credentials_keeps_the_cassettes(
     pytester, monkeypatch):
   monkeypatch.setenv("TEST_PSEUDONYM_KEY", "a key for the inner run")
-  monkeypatch.setenv("FBF_INNER_ASKED_FOR_CREDENTIALS", "no")
-  pytester.makeconftest(file_text(conftest.__file__))
+  make_inner_conftest(pytester, monkeypatch)
   pytester.makepyfile(test_inner=REWRITE_TESTS)
   cassette = pytester.path / "cassettes" / "test_inner" / "test_uses_fbf.yaml"
   write_interaction(cassette, "https://api.example.com/v1/users/current")
@@ -696,8 +720,9 @@ def interaction(path):
           "response": {"status": {"code": 200, "message": "OK"},
                        "headers": {}, "body": {"string": ""}}}
 
-def test_replay_fails_a_test_that_skips_a_recorded_request(pytester):
-  pytester.makeconftest(file_text(conftest.__file__))
+def test_replay_fails_a_test_that_skips_a_recorded_request(
+    pytester, monkeypatch):
+  make_inner_conftest(pytester, monkeypatch)
   pytester.makepyfile(test_inner=SKIPPING_TEST)
   cassette = pytester.path / "cassettes" / "test_inner"
   cassette.mkdir(parents=True)
@@ -1510,7 +1535,7 @@ def test_fetch():
 def test_a_recording_with_a_secret_fails_the_run(
     pytester, local_service, monkeypatch):
   monkeypatch.setenv("FBF_TEST_PATH", "/token")
-  pytester.makeconftest(file_text(conftest.__file__))
+  make_inner_conftest(pytester, monkeypatch)
   pytester.makepyfile(test_inner=RECORDING_TESTS)
   result = pytester.runpytest_inprocess(
     "--record-mode=once", "-p", "no:cacheprovider")
@@ -1521,7 +1546,7 @@ def test_a_recording_with_a_secret_fails_the_run(
 def test_drift_fails_a_live_run(
     pytester, local_service, monkeypatch, tmp_path):
   monkeypatch.setenv("FBF_TEST_PATH", "/data")
-  pytester.makeconftest(file_text(conftest.__file__))
+  make_inner_conftest(pytester, monkeypatch)
   pytester.makepyfile(test_inner=RECORDING_TESTS)
   write_interaction(pytester.path / "cassettes" / "test_inner"
                     / "test_fetch.yaml", local_service + "/data",
