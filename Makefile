@@ -20,6 +20,19 @@ test: compile
 build: compile
 	poetry build
 
+.PHONY: publish publish-github publish-fbf
+publish: publish-fbf publish-github
+
+publish-github: doc/fbf.pdf
+	git push
+	gh release create -t v${version} v${version} doc/fbf.pdf
+
+doc/fbf.pdf: $(wildcard src/fbf/*.nw)
+	${MAKE} -C $(dir $@) $(notdir $@)
+
+publish-fbf: build
+	poetry publish
+
 .PHONY: clean distclean
 clean:
 	${MAKE} -C tests clean
