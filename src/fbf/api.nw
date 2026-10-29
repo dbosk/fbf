@@ -539,4 +539,78 @@ def test_get_by_ids_batches_and_keeps_only_asked():
   ids = [f"u{n}" for n in range(120)] + [None, "u1"]
   users = fbf.get_by_ids("v1/users", ids)
   assert sorted(users) == sorted(f"u{n}" for n in range(120))
+
+
+\subsection{Against FBF}
+
+The tests above stop where the network starts.
+The ones below talk to FBF, through recordings in replay and for real with
+[[--live]] (\cref{Testing}), so they check what holds on any day: the shape
+of what comes back and how resources point to each other, not values.
+
+[[get]] on the current user is the simplest request there is, and it returns
+a single resource, not a list.
+<<test functions>>=
+import pytest
+
+@pytest.mark.vcr
+def test_get_returns_the_current_user(fbf):
+  document = fbf.get("v1/users/current")
+  assert not document.is_list
+  assert document.resource["type"] == "users"
+  assert document.resource["id"]
+@
+
+The views of an activity are a relationship that FBF gives only as a
+link, so [[related]] must fetch them.
+Every view it returns must point back to the activity we followed it from:
+that holds live as well as in replay, and it fails if [[related]] fetched the
+wrong link or read the wrong document.
+<<test functions>>=
+@pytest.mark.vcr
+def test_related_follows_a_link(fbf):
+  activity = fbf.get(f"v1/activities/{fbf.login.activity_uuid}").resource
+  views = fbf.related(activity, "views")
+  assert len(views) > 0
+  assert all(view["type"] == "views" for view in views)
+  assert {view["relationships"]["viewable"]["data"]["id"]
+          for view in views} == {fbf.login.activity_uuid}
+@
+
+Renewal on a [[401]] happens when the access token expires, after 30
+minutes.
+No test should wait that long, and a recording cannot make FBF refuse a
+token, so we inject the refusal: a session whose first request gets a
+[[401]] without reaching FBF.
+Everything after it is real: the refresh at [[/oauth/token]] and the
+repeated request go to FBF, or to the recording.
+We check the requests at the boundary, the session, since the renewal is
+visible nowhere else: in replay the old and the new tokens are the same
+placeholder.
+<<test functions>>=
+class FirstRequestUnauthorized(requests.Session):
+  """A session whose first request gets 401, as with an expired token."""
+
+  def __init__(self):
+    super().__init__()
+    self.sent = []
+
+  def request(self, method, url, *args, **kwargs):
+    self.sent.append((method, urllib.parse.urlsplit(url).path))
+    if len(self.sent) == 1:
+      response = requests.Response()
+      response.status_code = 401
+      response.url = url
+      return response
+    return super().request(method, url, *args, **kwargs)
+
+@pytest.mark.vcr
+def test_request_renews_the_tokens_on_401(fbf):
+  session = FirstRequestUnauthorized()
+  client = FBF(fbf.login, session=session)
+  document = client.get("v1/users/current")
+  assert document.resource["type"] == "users"
+  assert session.sent == [("GET", "/v1/users/current"),
+                          ("POST", TOKEN_PATH),
+                          ("GET", "/v1/users/current")]
 @

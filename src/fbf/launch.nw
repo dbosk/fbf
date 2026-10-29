@@ -432,5 +432,30 @@ def launch(canvas_url, canvas_token, course_id, assignment_id, session=None):
     return complete_launch(session, id_token_form)
 @
 
-The hops need Canvas and FBF to run, so the tests that cover them replay
-recorded traffic; see the testing chapter.
+The hops need Canvas and FBF to run, so the test that covers them replays
+a recorded launch (\cref{Testing}); with [[--live]] it launches for real.
+The same test body has to pass on both, so it checks what a launch must
+deliver whatever the course and the day: tokens, an API on an FBF host
+over HTTPS, and the UUIDs of the course and the activity.
+In replay the tokens are placeholders, since the recording keeps no secrets,
+but they must still be there.
+The checks go into variables before the asserts: [[pytest]] prints the
+values in a failed assert, and those would include a live token.
+
+<<test functions>>=
+import urllib.parse
+
+import pytest
+from conftest import ASSIGNMENT_ID, CANVAS_URL, COURSE_ID
+
+@pytest.mark.vcr
+def test_launch_gives_tokens_and_where_to_use_them(canvas_token):
+  login = launch(CANVAS_URL, canvas_token, COURSE_ID, ASSIGNMENT_ID)
+  has_tokens = bool(login.access_token) and bool(login.refresh_token)
+  assert has_tokens, "the launch gave no access or refresh token"
+  api = urllib.parse.urlsplit(login.api_url)
+  assert api.scheme == "https"
+  assert api.hostname.endswith(".feedbackfruits.com")
+  assert re.fullmatch(UUID, login.course_uuid or "")
+  assert re.fullmatch(UUID, login.activity_uuid or "")
+@
