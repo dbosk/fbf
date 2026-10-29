@@ -974,13 +974,18 @@ calendar feed, under [[calendar]] and [[ics]], as
 That address is a capability link: whoever has it reads the calendar,
 without logging in.
 The first real recording held one, which the scan rightly reported.
+FBF itself has one more: the [[pseudonym-seed]] of a participant, from
+which FBF derives the alias that it shows instead of a name in an anonymous
+peer review.
+Whoever has the seed can work out which alias was whose, which is what the
+anonymity is meant to prevent, and our code does not read it.
 Such values are replaced by a placeholder wherever their key occurs.
 <<scrubbing for FBF>>=
 FBF_PERSON_TYPES = {"users"}
 FBF_SECRET_KEYS = kebab({
     "access_token", "refresh_token", "id_token", "session_token",
     "login_hint", "lti_message_hint", "authenticity_token", "csrf_token",
-    "secure_params", "zendesk_hash", "ics"})
+    "secure_params", "zendesk_hash", "ics", "pseudonym_seed"})
 
 
 def is_person_resource(obj):
@@ -1073,6 +1078,12 @@ def test_recordings_replace_calendar_feeds(scrubber):
   course = {"id": 1, "name": "Course", "calendar": {
     "ics": "https://canvas.example.com/feeds/calendars/course_Ab3dEf6.ics"}}
   assert scrubber.scrub_json(course)["calendar"] == {"ics": "redacted"}
+
+def test_recordings_replace_pseudonym_seeds(scrubber):
+  allocation = {"type": "assignments/allocation", "id": "x1",
+                "attributes": {"pseudonym-seed": "0a1b2c3d4e5f6a7b"}}
+  scrubbed = scrubber.scrub_json(allocation)
+  assert scrubbed["attributes"]["pseudonym-seed"] == "redacted"
 @
 
 \subsubsection{Titles in Canvas objects}
