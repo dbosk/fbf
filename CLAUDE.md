@@ -33,7 +33,8 @@ Literate programs (noweb). Edit the `.nw` files, never the tangled `.py`/`.tex`
   names in a `<<required names>>` chunk, tangled into `schema.py` (add the
   chapter to `schema.py:` in `src/fbf/Makefile`); that chunk must not use the
   chapter's own constants.
-- `doc/fbf-api-shape.txt`: committed reference shape (names only, no values).
+- `src/fbf/api-shape.txt`: committed reference shape (names only, no values),
+  shipped in the package as `har-diff`'s default.
 - `doc/fbf.tex`: wraps the woven chapters into `doc/fbf.pdf`.
 
 ## Build and test

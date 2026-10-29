@@ -28,8 +28,11 @@ breaks us however its values look.
 So we reduce a HAR to its shape, which holds names only and no values, and
 compare shapes.
 The shape of a known-good capture is committed as
-[[doc/fbf-api-shape.txt]], and [[fbf har-diff]] compares a fresh capture with
+[[src/fbf/api-shape.txt]], and [[fbf har-diff]] compares a fresh capture with
 it.
+It lives in the package, next to this module, so that it is installed with
+[[fbf]]: whoever installs the package from PyPI has no repository, but still
+needs the reference to diff against.
 
 A shape is a text file of one record per line, which keeps it readable and
 lets [[git diff]] show its history.
@@ -573,8 +576,12 @@ Two commands make this usable from the shell.
 [[fbf har-shape]] prints the shape of one or more HAR files.
 With [[--update]] it instead merges them into the reference file as above,
 which is how the reference follows FBF.
-Redirecting its output to [[doc/fbf-api-shape.txt]] starts a new
+Redirecting its output to [[src/fbf/api-shape.txt]] starts a new
 reference.
+The default for both commands is the file next to this module.
+In a checkout of the repository, where the package is installed in editable
+mode, that is the committed file, so [[--update]] changes what [[git]]
+sees; in an installed package it is the copy that came with it.
 [[fbf har-diff]] compares a HAR with the reference.
 It exits with status~1 when the launch changed or something was removed,
 so that it can guard a script.
@@ -592,7 +599,7 @@ import pathlib
 import sys
 from fbf.schema import REQUIRED
 <<constants>>=
-REFERENCE_SHAPE = "doc/fbf-api-shape.txt"
+REFERENCE_SHAPE = str(pathlib.Path(__file__).with_name("api-shape.txt"))
 SHAPE_HEADER = """\
 # The shape of FeedbackFruits' launch and API, made by `fbf har-shape`.
 # Names only, no values.  Compare a fresh capture with `fbf har-diff`.
@@ -654,6 +661,15 @@ def test_har_diff_command_marks_required_removal(tmp_path, capsys):
   assert "!!type tasks attribute title" in capsys.readouterr().out
 @
 
+The default reference must be there for [[har-diff]] to work without
+[[-r]]; it is in the package only if the build includes it.
+<<test functions>>=
+def test_the_default_reference_shape_is_shipped():
+  shape = read_shape(REFERENCE_SHAPE)
+  assert any(record.startswith("launch ") for record in shape)
+  assert any(record.startswith("type ") for record in shape)
+@
+
 The arguments are registered by a function of their own, so that the
 standalone command and [[canvaslms]] share them.
 
@@ -666,7 +682,7 @@ def add_command(subp):
     shape_parser.add_argument(
         "-u", "--update", metavar="SHAPE", nargs="?", const=REFERENCE_SHAPE,
         help="merge into this shape file instead of printing, "
-             f"default {REFERENCE_SHAPE}")
+             "default: the reference shipped with fbf")
     shape_parser.set_defaults(func=har_shape_command)
 
     diff_parser = subp.add_parser(
@@ -674,7 +690,7 @@ def add_command(subp):
     diff_parser.add_argument("har", nargs="+", help="HAR file(s)")
     diff_parser.add_argument(
         "-r", "--reference", default=REFERENCE_SHAPE,
-        help=f"reference shape file, default {REFERENCE_SHAPE}")
+        help="reference shape file, default: the one shipped with fbf")
     diff_parser.set_defaults(func=har_diff_command)
 @
 
