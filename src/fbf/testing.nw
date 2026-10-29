@@ -1005,6 +1005,39 @@ def test_recordings_replace_fbfs_own_fields(scrubber):
   assert activity == {"title": "Peer review 1", "name": "Peer review 1"}
 @
 
+\subsubsection{Titles in Canvas objects}
+
+The first recording replaced the title of an assignment in one place and
+kept it in another: as the [[name]] of the Canvas assignment it became a
+pseudonym, and its words were noted as originals; as the [[title]] of the
+FBF activity it was kept, and the scan after the run reported it.
+The Canvas assignment looked like a person to [[vcr_support]], because it
+has a key [[integration_id]], one of the login keys, which marks an object
+as a person's; Canvas sets that key on many objects, and on an assignment
+it is [[null]].
+We keep titles, as course content, so the fix is to the test for a person:
+an identity field marks a person only if it holds a value.
+An empty one identifies no one.
+Under a key that names a person, such as [[user]], an object is still a
+person's regardless.
+<<[[FBFPseudonymizer]] methods>>=
+def _is_person(self, obj, parent):
+    filled = {key: value for key, value in obj.items()
+              if value not in (None, "", [], {})}
+    return super()._is_person(filled, parent)
+@
+
+Let's verify it with a Canvas assignment and a Canvas user, both made up.
+<<test functions>>=
+def test_only_filled_identity_fields_make_a_person(scrubber):
+  assignment = {"id": 1, "name": "Reflection on peer review",
+                "integration_id": None, "sis_assignment_id": None}
+  user = {"id": 2, "name": "Anna Andersson", "integration_id": "a1"}
+  scrubbed = scrubber.scrub_json([assignment, user])
+  assert scrubbed[0]["name"] == "Reflection on peer review"
+  assert scrubbed[1]["name"].startswith("Person-")
+@
+
 \subsubsection{Free text that is not a string}
 \label{FreeTextObjects}
 
