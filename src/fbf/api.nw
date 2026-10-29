@@ -321,7 +321,16 @@ task has progresses, a progress has an actor.
 It prefers the [[data]] reference when the resource is already in an
 [[included]] list we hold, which saves a request, and otherwise fetches the
 [[related]] link.
-When neither exists, the relationship is empty and we return [[None]].
+When neither exists, the relationship is empty and we return [[None]] (or
+an empty list).
+
+There is a third case, and FBF has it: references without a link, as in an
+activity's [[tasks]].
+The related resources exist, but we cannot know where to fetch them from
+their type alone ([[multimedia-tasks]] lives under [[/v1/tasks]]).
+Returning an empty list there would be the worst answer, a silent wrong
+one, so we raise [[LookupError]] and point to the remedy: fetch the resource
+with [[include]] set to the relationship and pass its [[included]].
 
 <<FBF methods>>=
 def related(self, resource, name, included=None):
@@ -342,5 +351,36 @@ def related(self, resource, name, included=None):
     if link:
         document = self.get(link)
         return document.resources if document.is_list else document.resource
+    if references:
+        raise LookupError(
+            f"{resource['type']}.{name}: references but no link; "
+            f"get the resource with include={name!r} and pass its included")
     return [] if isinstance(data, list) else None
+@
+
+The decisions of [[related]] that need no network: references found in
+[[included]], an empty relationship, and references we cannot resolve.
+Here a client without a session suffices, since none of these cases sends a
+request.
+
+<<test functions>>=
+TASK = {"type": "instruct-tasks", "id": "t1"}
+ACTIVITY = {"type": "activities", "id": "a1", "relationships": {
+  "tasks": {"data": [{"type": "instruct-tasks", "id": "t1"}]},
+  "note": {"data": None}, "folder": {"data": []}}}
+
+def test_related_uses_included():
+  fbf = FBF(login=None)
+  included = index_resources([TASK])
+  assert fbf.related(ACTIVITY, "tasks", included) == [TASK]
+
+def test_related_empty_relationships():
+  fbf = FBF(login=None)
+  assert fbf.related(ACTIVITY, "note") is None
+  assert fbf.related(ACTIVITY, "folder") == []
+
+def test_related_refuses_unresolvable_references():
+  import pytest
+  with pytest.raises(LookupError, match="include='tasks'"):
+    FBF(login=None).related(ACTIVITY, "tasks")
 @
