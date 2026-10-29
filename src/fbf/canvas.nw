@@ -204,3 +204,34 @@ def fbf_activities(canvas_url, canvas_token, assignments):
         for assignment in course:
             yield assignment, fbf, codes.get(placement_code(assignment))
 @
+
+The contract test of \cref{Schema} needs an example of a placement to check
+the names above on.
+The launched activity has one: its [[placement]] relationship refers to it,
+and FBF includes it when asked.
+<<example fetchers>>=
+@example("lti/placement")
+def placement_of_the_launched_activity(fbf, launched):
+    document = fbf.get(f"v1/activities/{launched.activity_uuid}",
+                       include="placement")
+    return fbf.related(document.resource, "placement",
+                       included=document.included)
+@
+
+The same placement lets us test [[activity_id]] against FBF.
+Looking up the placement's code must lead back to the activity the placement
+came from, which is the activity we launched.
+That holds on any day, live or replayed, and it fails if the filter or our
+check of the code goes wrong.
+<<test functions>>=
+import pytest
+
+import conftest
+from fbf.schema import attribute
+
+@pytest.mark.vcr
+def test_activity_id_finds_the_launched_activity(fbf):
+  placement = conftest.EXAMPLES["lti/placement"](fbf, fbf.login)
+  code = attribute(placement, "code")
+  assert activity_id(fbf, code) == fbf.login.activity_uuid
+@

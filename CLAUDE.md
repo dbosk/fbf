@@ -35,6 +35,30 @@ Literate programs (noweb). Edit the `.nw` files, never the tangled `.py`/`.tex`
     make test                    # tangle tests from <<test [[x.py]]>> chunks, run pytest
     make -C doc fbf.pdf LATEXFLAGS="-interaction=nonstopmode"
 
+## Testing
+
+The test setup is the Testing chapter, `src/fbf/testing.nw`, tangled to
+`tests/conftest.py` (together with the `<<example fetchers>>` chunks of all
+chapters). `tests/vcr_support.py` is an unchanged copy of the testing skill's
+asset; FBF/Canvas key lists live in `testing.nw`.
+
+- `make test` is offline (`--block-network`): service tests replay cassettes
+  from `tests/cassettes/` and are skipped if none were recorded.
+- `make test PYTESTFLAGS=--live` launches through Canvas course 63874,
+  assignment 402780, re-records into a private directory and fails on
+  structural drift against the cassettes.
+- `--record-mode=once` (missing) or `--record-mode=rewrite` records.
+  Tests marked `mutates` reach FBF only with `--live-writes`.
+- Recording and live runs need `TEST_PSEUDONYM_KEY`:
+  `TEST_PSEUDONYM_KEY="$(secret-tool lookup service fbf key test-pseudonym)"`.
+  Never print it. They also need a `canvaslms login`.
+- Cassettes hold a real course's data (pseudonymized) and are gitignored.
+- Every type declared with `requires(...)` needs an `@example(kind)` fetcher
+  in an `<<example fetchers>>` chunk, or the contract test in `schema.nw`
+  fails.
+- Agents: use the main repo's venv, not `poetry run`, in a worktree:
+  `make -C tests all PYTEST="<venv>/bin/python -m pytest"`.
+
 ## Privacy and secrets
 
 - HAR files hold live session cookies and student data: never in the repo

@@ -123,3 +123,49 @@ def test_requires_records_shape_lines():
   assert {"type test-type attribute a",
           "type test-type relationship r"} <= REQUIRED
 @
+
+
+\section{The contract with FBF}
+
+The declarations are only worth something if they are true of FBF.
+The contract test checks them, one declared type at a time: it fetches an
+example resource of the type and requires every declared name of that type
+to be among the resource's attribute and relationship names.
+It compares in the shape format, with [[type_records]] from \cref{HAR},
+which turns a resource into exactly the records that [[requires]] makes.
+
+How to get an example differs by type, so each chapter registers a fetcher
+for the types it declares (\cref{Examples}).
+A type without a fetcher fails the test, with a message that says what to
+add: otherwise a new chapter could declare names that nothing ever checks.
+That check comes before anything that needs FBF, so it fails offline too,
+even where the recordings are missing and the rest of the test is skipped.
+
+The test runs in both modes.
+With [[--live]] it is the real contract test: it checks our declarations
+against FBF as it is today.
+In replay it checks them against the recording, which catches a mistyped
+declaration at once, and a declaration added after the recording, until we
+record again.
+The assertion shows the missing records, which are names, never values.
+<<test functions>>=
+import conftest
+from fbf.har import type_records
+
+DECLARED_TYPES = sorted({record.split()[1] for record in REQUIRED})
+
+@pytest.mark.vcr
+@pytest.mark.parametrize("kind", DECLARED_TYPES)
+def test_fbf_has_the_names_we_depend_on(kind, request):
+  fetch = conftest.EXAMPLES.get(kind)
+  if fetch is None:
+    pytest.fail(f"no example of {kind!r} to check its names on; register "
+                f"one with @example({kind!r}) in an @<<example fetchers>> "
+                "chunk of the chapter that declares it", pytrace=False)
+  fbf = request.getfixturevalue("fbf")
+  resource = fetch(fbf, fbf.login)
+  assert resource["type"] == kind
+  declared = {record for record in REQUIRED if record.split()[1] == kind}
+  missing = sorted(declared - set(type_records(resource)))
+  assert missing == []
+@
