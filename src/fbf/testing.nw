@@ -139,6 +139,7 @@ Some of them run [[pytest]] itself on a small test file, through the
 [[pytester]] fixture, which comes in a plugin that we enable above.
 <<test [[testing.py]]>>=
 import json
+import os
 import urllib.parse
 
 import pytest
@@ -387,7 +388,7 @@ def recording(record_mode):
 
 
 @pytest.fixture(scope="session", autouse=True)
-def launched(recording, pytestconfig, pseudonymizer):
+def launched(recording, pytestconfig, pseudonymizer, canvas_credentials):
     """The launch that the tests share when they talk to FBF, or the reason
     why there is none.  Launches before any cassette opens."""
     if not recording:
@@ -395,7 +396,7 @@ def launched(recording, pytestconfig, pseudonymizer):
     cassette = recording_dir(pytestconfig, LAUNCH_CASSETTE.parent) \
         / LAUNCH_CASSETTE.name
     return log_in_for_tests(
-        lambda: launch_for_tests(cassette, pseudonymizer),
+        lambda: launch_for_tests(cassette, pseudonymizer, canvas_credentials),
         into_project=not pytestconfig.getoption("--live"))
 @
 
@@ -456,13 +457,67 @@ def test_a_login_that_loops_is_a_bug_not_a_missing_login():
     conftest.log_in_for_tests(looping_login, into_project=False)
 @
 
+That the guard sits in the right place matters as much: it must stop the run
+before [[pytest-recording]] opens, and with [[rewrite]] deletes, a test's
+cassette.
+Let's verify that with a run that records with [[rewrite]] over a cassette
+that is already there, on a machine without credentials: the run must stop
+with an error, and the cassette must still be there.
+The inner run gets its credentials from a fixture that finds none, whatever
+this machine has stored, and notes in the environment that it was asked.
+<<test functions>>=
+REWRITE_TESTS = """
+import os
+
+import pytest
+
+import conftest
+
+@pytest.fixture(scope="session")
+def canvas_credentials():
+  def none_stored():
+    os.environ["FBF_INNER_ASKED_FOR_CREDENTIALS"] = "yes"
+    raise conftest.CredentialsMissing("the inner run has no login")
+  return none_stored
+
+@pytest.mark.vcr
+def test_uses_fbf(fbf):
+  pass
+"""
+
+def test_a_rewrite_without_credentials_keeps_the_cassettes(
+    pytester, monkeypatch):
+  monkeypatch.setenv("TEST_PSEUDONYM_KEY", "a key for the inner run")
+  monkeypatch.setenv("FBF_INNER_ASKED_FOR_CREDENTIALS", "no")
+  pytester.makeconftest(file_text(conftest.__file__))
+  pytester.makepyfile(test_inner=REWRITE_TESTS)
+  cassette = pytester.path / "cassettes" / "test_inner" / "test_uses_fbf.yaml"
+  write_interaction(cassette, "https://api.example.com/v1/users/current")
+  result = pytester.runpytest_inprocess(
+    "--record-mode=rewrite", "-p", "no:cacheprovider")
+  assert result.ret == 1
+  result.stdout.fnmatch_lines(["*cannot launch FBF, so nothing is recorded*"])
+  assert os.environ["FBF_INNER_ASKED_FOR_CREDENTIALS"] == "yes"
+  assert cassette.exists()
+@
+
 The credentials are those of [[canvaslms]], which keeps them in the keyring,
 the environment or its configuration.
 [[canvaslms]] is not a dependency of [[fbf]] itself, so a machine without it
 simply has no credentials.
 We take only the token: the cassettes are recorded against [[CANVAS_URL]],
 and replay must ask for the same host.
+The function that reads them is what the fixture [[canvas_credentials]]
+gives; the inner runs that test this configuration replace it with one
+that never finds any.
 <<test fixtures>>=
+@pytest.fixture(scope="session")
+def canvas_credentials():
+    """The function that returns the Canvas token to launch with, or raises
+    `CredentialsMissing`."""
+    return canvas_token_for_tests
+
+
 def canvas_token_for_tests():
     """Return the Canvas API token that `canvaslms` stores."""
     try:
@@ -506,9 +561,9 @@ class Launched:
     login: object
 
 
-def launch_for_tests(cassette, pseudonymizer):
+def launch_for_tests(cassette, pseudonymizer, canvas_credentials):
     """Launch FBF for real, recording the launch into `cassette`."""
-    canvas_token = canvas_token_for_tests()
+    canvas_token = canvas_credentials()
     cassette.parent.mkdir(parents=True, exist_ok=True)
     partial = cassette.with_suffix(".partial.yaml")
     try:
