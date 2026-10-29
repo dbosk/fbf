@@ -1132,6 +1132,72 @@ def test_an_object_with_a_type_that_is_no_string_is_no_resource(scrubber):
                                "attributes": {"a": 1}}}
 @
 
+\subsubsection{Scrubbing what is already scrubbed}
+
+The pseudonymizer sees recorded responses a second time: [[vcrpy]] runs the
+response hook also on the responses it loads from a cassette, which a
+recording with [[--record-mode=once]] does for every cassette that already
+exists.
+The values are then our own placeholders and pseudonyms, and the
+pseudonymizer took them for originals: it noted the placeholder for free
+text in the list of originals, and the scan after the run found it, rightly, in
+every cassette with free text.
+A pseudonym fared worse: [[Person-]]\ldots\ became another pseudonym, and the
+first one was noted as an original that the cassette is full of.
+
+So scrubbing must leave its own output alone.
+A name or a login that already is a pseudonym stays as it is (an email
+address at [[example.invalid]], which ours are, [[vcr_support]] already
+keeps), and neither placeholders nor pseudonyms are ever noted as
+originals.
+<<scrubbing for FBF>>=
+OUR_PLACEHOLDERS = {vcr_support.FREE_TEXT_PLACEHOLDER,
+                    vcr_support.CONTACT_PLACEHOLDER,
+                    vcr_support.SECRET_PLACEHOLDER,
+                    vcr_support.URL_PLACEHOLDER}
+OUR_PSEUDONYM = re.compile(
+    r"(?i)(?:person|user)-[0-9a-f]{6}(?:@example\.invalid)?")
+
+
+def is_ours(value):
+    """True if `value` is a placeholder or a pseudonym of ours."""
+    return value in OUR_PLACEHOLDERS or bool(OUR_PSEUDONYM.fullmatch(value))
+<<[[FBFPseudonymizer]] methods>>=
+def _log(self, *values):
+    super()._log(*[value for value in values if not is_ours(value)])
+
+
+def name(self, value):
+    return value if is_ours(value) else super().name(value)
+
+
+def login(self, value):
+    return value if is_ours(value) else super().login(value)
+@
+
+Let's verify it by scrubbing a document twice, while noting originals in a
+file of our own: the second pass must change nothing and note nothing.
+<<test functions>>=
+SCRUBBED_TWICE = {"data": [
+  {"type": "users", "id": "u1",
+   "attributes": {"name": "Anna Andersson", "email": "anna@uni.example.se",
+                  "login_id": "anna"}},
+  {"type": "reflections", "id": "r1",
+   "attributes": {"body": {"ops": [{"insert": "Ask Bo Berg.\n"}]},
+                  "description": "Do it with Bo"}},
+]}
+
+def test_scrubbing_leaves_its_own_output_alone(tmp_path):
+  originals = tmp_path / "originals.txt"
+  first = conftest.FBFPseudonymizer(b"a key for the tests", originals)
+  once = first.scrub_json(json.loads(json.dumps(SCRUBBED_TWICE)))
+  noted = originals.read_text()
+  second = conftest.FBFPseudonymizer(b"a key for the tests", originals)
+  twice = second.scrub_json(json.loads(json.dumps(once)))
+  assert twice == once
+  assert originals.read_text() == noted
+@
+
 \subsubsection{Secrets in URLs}
 
 The launch passes one-time secrets in URLs.
