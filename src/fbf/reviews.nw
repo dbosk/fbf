@@ -790,39 +790,6 @@ def test_feedback_enabled_and_reviewed():
   assert not reviewed(allocation("a", reviews=0, ratings=0))
 @
 
-The feedback lists must not be asked for allocations without a review, and
-the test of that is [[allocation_lists]] with [[reviewed]].
-A client that answers every request with an empty list and remembers the
-paths is enough here (rung~4 of the testing ladder): the question is which
-requests we send, which a recording would answer too, but only once one
-exists.
-
-<<test functions>>=
-from fbf.api import Document
-
-class ListingClient:
-  def __init__(self):
-    self.asked = []
-  def get_many(self, requests):
-    self.asked += [path for path, _ in requests]
-    return [Document({"data": [{"type": "x", "id": path}]})
-            for path, _ in requests]
-
-def test_allocation_lists_asks_only_allocations_with_something():
-  client = ListingClient()
-  allocations = [allocation("a1", reviews=1, ratings=0),
-                 allocation("a2", reviews=0, ratings=0)]
-  lists = allocation_lists(client, allocations,
-                           {"reviews": counted("reviews-count"),
-                            "ratings": counted("ratings-count"),
-                            "reviewer-feedback": reviewed})
-  assert sorted(client.asked) == ["/f/a1", "/r/a1"]
-  assert {name: [r["id"] for r in found]
-          for name, found in lists.items()} \
-    == {"reviews": ["/r/a1"], "ratings": [], "reviewer-feedback": ["/f/a1"]}
-@
-
-
 \section{Reflections}
 
 The reflections are one list behind the reflect task.
@@ -851,17 +818,182 @@ def make_reflections(activity, reflections, users):
 @
 
 <<test functions>>=
+def reflection(user, text):
+  return {"type": "reflections", "id": user,
+          "attributes": {"body": {"ops": [{"insert": text}]}},
+          "relationships": {"user": ref("users", user)}}
+
 def test_make_reflections_reads_deltas_and_sorts_by_student():
-  def reflection(user, text):
-    return {"type": "reflections", "id": user,
-            "attributes": {"body": {"ops": [{"insert": text}]}},
-            "relationships": {"user": ref("users", user)}}
   result = make_reflections("Essay", [reflection("u3", "Agreed"),
                                       reflection("u2", "Fun\n")], USERS)
   assert [(r.student, r.body) for r in result] \
     == [("Ada", "Fun\n"), ("Cy", "Agreed")]
 @
 
+
+\section{The fetchers, offline}
+
+The fetchers decide which requests to send and join what comes back, and
+those decisions need tests that run everywhere.
+The recorded tests (rung~3 of the testing ladder) cannot be those: the
+cassettes hold a real course's data, so they stay on the machine that
+recorded them (\cref{Testing}), and a fresh checkout or worktree skips
+every recorded test.
+So we step down to rung~4, a hand-written fake of our own client, [[FBF]].
+It has the three methods the fetchers use, [[get]], [[get_many]] and
+[[get_by_ids]], serves resources shaped like FBF's by path, and logs the
+paths asked for.
+Like FBF, it answers an empty list for a list that has nothing, and like
+[[get_by_ids]] it returns only the ids asked for.
+The recorded tests keep the fake honest: they check against FBF the shapes
+that the fake assumes.
+
+<<test functions>>=
+from fbf.api import Document
+
+class FakeFBF:
+  """Serves hand-built resources by path, as FBF would, and logs paths."""
+
+  def __init__(self, documents, by_id):
+    self.documents = documents
+    self.by_id = by_id
+    self.asked = []
+
+  def get(self, path, **params):
+    self.asked.append(path)
+    return Document(self.documents.get(path, {"data": []}))
+
+  def get_many(self, requests):
+    return [self.get(path, **params) for path, params in requests]
+
+  def get_by_ids(self, path, ids):
+    self.asked.append(path)
+    wanted = set(ids)
+    return {id: r for id, r in self.by_id[path].items() if id in wanted}
+@
+
+The first question is which lists we ask for.
+An allocation whose counts are zero must cost no request, whatever the
+relationship.
+
+<<test functions>>=
+def test_allocation_lists_asks_only_allocations_with_something():
+  fbf = FakeFBF({"/r/a1": {"data": [review("r1", "a1", "c2", "Fine",
+                                           "2026-10-01T10:00Z")]}}, {})
+  allocations = [allocation("a1", reviews=1, ratings=0),
+                 allocation("a2", reviews=0, ratings=0)]
+  lists = allocation_lists(fbf, allocations,
+                           {"reviews": counted("reviews-count"),
+                            "ratings": counted("ratings-count"),
+                            "reviewer-feedback": reviewed})
+  assert sorted(fbf.asked) == ["/f/a1", "/r/a1"]
+  assert {name: [r["id"] for r in found]
+          for name, found in lists.items()} \
+    == {"reviews": ["r1"], "ratings": [], "reviewer-feedback": []}
+@
+
+For the fetchers as a whole the fake serves a small course: a peer review
+[[act]] and a video [[video]].
+In the peer review Bo reviews Ada with a level and a comment, Cy reviews
+Ada with a comment only, and Ada was to review Cy but never started.
+Bo's level is an option that the rubric no longer lists, as when a teacher
+edits the rubric after the reviews; that is why [[fetch_reviews]] also asks
+for the options that the ratings chose.
+Both reviews got feedback, and two students reflected.
+
+<<test functions>>=
+def task(kind, id, links=(), **attributes):
+  return {"type": kind, "id": id, "attributes": attributes,
+          "relationships": {name: {"links": {"related": f"/{id}/{name}"}}
+                            for name in links}}
+
+def course_with_a_peer_review(feedback_on=True):
+  tasks = [task(REVIEW_TASK, "t1", ["criteria", "allocations"]),
+           task(VIEW_TASK, "t2",
+                **{"reviewer-feedback-enabled": feedback_on}),
+           task(REFLECT_TASK, "t3", ["reflections"])]
+  documents = {
+    "v1/activities/act": {"data": {"type": "activities", "id": "act"},
+                          "included": tasks},
+    "v1/activities/video": {"data": {"type": "activities", "id": "video"},
+                            "included": [task("multimedia-tasks", "t4")]},
+    "/t1/criteria": {"data": CRITERIA},
+    "/t1/allocations": {"data": [
+      allocation("a1", "u1", "u2", reviews=1, ratings=1),
+      allocation("a2", "u3", "u2", reviews=1, ratings=0),
+      allocation("a3", "u2", "u3", reviews=0, ratings=0)]},
+    "/r/a1": {"data": [review("r1", "a1", "c1", "Clear!",
+                              "2026-10-01T10:00Z")]},
+    "/s/a1": {"data": [rating("s1", "a1", "c1", "o2")]},
+    "/r/a2": {"data": [review("r2", "a2", "c2", "Fine",
+                              "2026-10-01T11:00Z")]},
+    "/f/a1": {"data": [feedback("f1", "a1", 5, "Thanks")]},
+    "/f/a2": {"data": [feedback("f2", "a2", 3, "")]},
+    "/t3/reflections": {"data": [reflection("u3", "Agreed"),
+                                 reflection("u2", "Fun")]}}
+  by_id = {"v1/users": USERS,
+           "v1/assignments/criterion_options": {
+             **OPTIONS, "o2": option("o2", "Retired", 2)}}
+  return FakeFBF(documents, by_id)
+@
+
+The tasks are found among the resources included with the activity, and an
+activity without a review task is no peer review.
+
+<<test functions>>=
+def test_peer_review_tasks_tells_peer_reviews_from_others():
+  fbf = course_with_a_peer_review()
+  assert set(peer_review_tasks(fbf, "act")) \
+    == {REVIEW_TASK, VIEW_TASK, REFLECT_TASK}
+  assert peer_review_tasks(fbf, "video") is None
+@
+
+[[fetch_reviews]] gives Bo's level, from the option the rubric no longer
+lists, and Cy's comment, and it asks for no list that the counts say is
+empty.
+
+<<test functions>>=
+def lists_asked(fbf):
+  return sorted(path for path in fbf.asked
+                if path.startswith(("/r/", "/s/", "/f/")))
+
+def test_fetch_reviews_end_to_end():
+  fbf = course_with_a_peer_review()
+  result = fetch_reviews(fbf, peer_review_tasks(fbf, "act"), "Essay")
+  assert [(r.activity, r.reviewee, r.reviewer, r.criterion, r.level,
+           r.score, [c.body for c in r.comments]) for r in result] == [
+    ("Essay", "Ada", "Bo", "Clarity", "Retired", 2, ["Clear!"]),
+    ("Essay", "Ada", "Cy", "Overall", "", None, ["Fine"])]
+  assert lists_asked(fbf) == ["/r/a1", "/r/a2", "/s/a1"]
+@
+
+[[fetch_feedback]] asks each allocation with a review, and sends no request
+at all, not even for the allocations, when feedback is off.
+
+<<test functions>>=
+def test_fetch_feedback_end_to_end_and_only_when_enabled():
+  fbf = course_with_a_peer_review()
+  result = fetch_feedback(fbf, peer_review_tasks(fbf, "act"), "Essay")
+  assert [(f.reviewee, f.reviewer, f.rating, f.body) for f in result] \
+    == [("Ada", "Bo", 5, "Thanks"), ("Ada", "Cy", 3, "")]
+  assert lists_asked(fbf) == ["/f/a1", "/f/a2"]
+  off = course_with_a_peer_review(feedback_on=False)
+  tasks = peer_review_tasks(off, "act")
+  off.asked.clear()
+  assert fetch_feedback(off, tasks, "Essay") == []
+  assert off.asked == []
+@
+
+[[fetch_reflections]] must name the students, whom the reflections give
+only by id.
+
+<<test functions>>=
+def test_fetch_reflections_end_to_end():
+  fbf = course_with_a_peer_review()
+  result = fetch_reflections(fbf, peer_review_tasks(fbf, "act"), "Essay")
+  assert [(r.activity, r.student, r.body) for r in result] \
+    == [("Essay", "Ada", "Fun"), ("Essay", "Cy", "Agreed")]
+@
 
 \section{Output}
 
