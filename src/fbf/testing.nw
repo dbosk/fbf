@@ -920,8 +920,9 @@ FBF_SECRET_KEYS = kebab({
 
 def is_person_resource(obj):
     """True if `obj` is a JSON:API resource that describes a person."""
-    return (obj.get("type") in FBF_PERSON_TYPES
-            and isinstance(obj.get("attributes"), dict))
+    kind = obj.get("type")
+    return (isinstance(kind, str) and kind in FBF_PERSON_TYPES
+            and "id" in obj and isinstance(obj.get("attributes"), dict))
 
 
 def redact_secret(key, value):
@@ -1005,6 +1006,7 @@ def test_recordings_replace_fbfs_own_fields(scrubber):
 @
 
 \subsubsection{Free text that is not a string}
+\label{FreeTextObjects}
 
 [[vcr_support]] replaces a free-text field only when its value is a string.
 FBF's reflections are not: their [[body]] is a Quill Delta, the rich-text
@@ -1086,6 +1088,48 @@ def test_recordings_replace_free_text_that_is_not_a_string(scrubber):
   assert comment["attributes"]["body"] == ["[redacted free text]"]
   assert reflection["relationships"]["comments"]["links"]["related"] \
     == "/v1/reflections/r1/comments"
+@
+
+\subsubsection{Keywords}
+
+A review criterion has [[aggregated-keywords]]: the words that FBF picks out
+of the students' reviews, as an object keyed by the word.
+Two things follow.
+First, the keys of that object are student text, and any word can be one,
+[[type]] and [[name]] included; the first recording failed on a keyword
+[[type]] whose value was an object, which our test for a person's resource
+tried to look up in a set.
+A JSON:API resource has a string [[type]] and an [[id]], so we require both
+before we take an object for a resource.
+Second, the keywords are free text: they are words of the students' prose,
+and a word can be a name.
+So [[aggregated-keywords]] is a free-text key, and the object is replaced
+wholesale like a Delta (\cref{FreeTextObjects}), keys and all.
+<<scrubbing for FBF>>=
+FBF_FREE_TEXT_KEYS |= {"aggregated-keywords"}
+@
+
+Let's verify both with a criterion whose keywords, made up, include
+[[type]] and [[name]], and with an object elsewhere that has a [[type]]
+that is no string.
+<<test functions>>=
+CRITERION = {"data": {
+  "type": "assignments/criterion", "id": "k1",
+  "attributes": {"title": "Structure", "aggregated-keywords": {
+    "type": {"count": 2}, "name": {"count": 1}, "Bo Berg": {"count": 1}}}}}
+
+def test_recordings_replace_keywords_whatever_they_are(scrubber):
+  scrubbed = scrubber.scrub_json(json.loads(json.dumps(CRITERION)))
+  attributes = scrubbed["data"]["attributes"]
+  assert attributes["aggregated-keywords"] == "[redacted free text]"
+  assert attributes["title"] == "Structure"
+  assert "Bo Berg" not in json.dumps(scrubbed)
+
+def test_an_object_with_a_type_that_is_no_string_is_no_resource(scrubber):
+  scrubbed = scrubber.scrub_json({"meta": {"type": {"count": 2},
+                                           "attributes": {"a": 1}}})
+  assert scrubbed == {"meta": {"type": {"count": 2},
+                               "attributes": {"a": 1}}}
 @
 
 \subsubsection{Secrets in URLs}
