@@ -1525,6 +1525,12 @@ that a client needs, and [[vcr_support]] then replaces the values of the
 cookies and scrubs the [[Location]].
 The others would only tell a reader about the session (Canvas sends request
 and session identifiers), and none of our code reads them.
+One that a client does read is [[Link]]: Canvas pages its lists and names
+the next page there, and [[canvasapi]] follows it.
+Without it, a replayed list ends after its first page, and an early real
+recording showed what that does: the test of the progress chapter passed in
+replay on half the students, and only the check that every recorded request
+is made again (\cref{TestLaunch}) noticed the missing pages.
 
 The cookies also lose their lifetime.
 FBF's [[access_token]] cookie expires after 30~minutes, and [[requests]]
@@ -1542,7 +1548,7 @@ name, after the launch has set them, so that does not matter to it.
 cassettes recorded before this rule are fixed as they are read.
 <<scrubbing for FBF>>=
 KEPT_RESPONSE_HEADERS = {"content-type", "content-length", "location",
-                         "set-cookie"}
+                         "set-cookie", "link"}
 COOKIE_LIFETIME = re.compile(r"(?i);\s*(?:expires|max-age)=[^;]*")
 <<[[FBFPseudonymizer]] methods>>=
 def before_record_response(self, response):
@@ -1618,6 +1624,13 @@ def test_recordings_redact_redirects_and_cookies(scrubber):
     "https://canvas.example.com/api/lti/authorize"
     "?state=redacted&client_id=1000"]
   assert headers["Set-Cookie"] == ["access_token=redacted; path=/; secure"]
+
+def test_recordings_keep_the_links_to_the_next_page(scrubber):
+  link = ('<https://canvas.example.com/api/v1/courses/1/users?page=2>; '
+          'rel="next"')
+  response = scrubber.before_record_response(recorded_response(
+    "", **{"Link": [link]}))
+  assert response["headers"]["Link"] == [link]
 @
 
 A recorded cookie must survive in replay however long after the recording
