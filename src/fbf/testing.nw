@@ -951,6 +951,10 @@ The user has only attributes that FBF's users have.
 An [[avatar-url]] among them would by itself make the attributes look like a
 person's, and the test would pass with the rule for [[users]] broken, so the
 avatar sits in a resource of its own.
+The email address is at a made-up university, not at a real domain.
+It cannot be at [[example.com]] either: [[vcr_support]] keeps addresses at
+the domains reserved for examples as they are, since they belong to nobody,
+so the test would no longer show that a real address is replaced.
 <<test functions>>=
 @pytest.fixture
 def scrubber():
@@ -964,7 +968,7 @@ FBF_DOCUMENT = {
     {"type": "media", "id": "m1",
      "attributes": {"avatar-url": "https://example.com/anna.png"}},
     {"type": "emails", "id": "e1",
-     "attributes": {"address": "anna@kth.se"}},
+     "attributes": {"address": "anna@uni.example.se"}},
     {"type": "comments", "id": "c1",
      "attributes": {"body": "Ask Bo Berg.", "body-rendered": "<p>Ask</p>"}},
     {"type": "open-questions", "id": "q1",
@@ -979,11 +983,13 @@ FBF_DOCUMENT = {
 def test_recordings_replace_fbfs_own_fields(scrubber):
   scrubbed = scrubber.scrub_json(json.loads(json.dumps(FBF_DOCUMENT)))
   text = json.dumps(scrubbed)
-  for value in ("Anna", "Andersson", "anna@kth.se", "0a1b2c3d4e5f",
+  for value in ("Anna", "Andersson", "anna@uni.example.se", "0a1b2c3d4e5f",
                 "anna.png", "Bo Berg", "<p>", "Fortytwo"):
     assert value not in text, value
   user = scrubbed["data"]["attributes"]
   assert user["zendesk-hash"] == "redacted"
+  email = scrubbed["included"][1]["attributes"]["address"]
+  assert email.endswith("@example.invalid")
   activity = scrubbed["included"][-1]["attributes"]
   assert activity == {"title": "Peer review 1", "name": "Peer review 1"}
 @
