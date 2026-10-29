@@ -1,2 +1,6 @@
 __pycache__/
 test_*.py
+conftest.py
+# Recordings of FBF hold real students' data, pseudonymized, so they stay on
+# the machine that made them (see the Testing chapter, src/fbf/testing.nw).
+cassettes/

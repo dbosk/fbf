@@ -1,0 +1,1292 @@
+\chapter{Testing}
+\label{Testing}
+
+The tests live in the same files as the code they verify, right after it,
+and [[make test]] tangles them into [[tests/test_*.py]] and runs [[pytest]].
+This chapter covers what the individual tests share: how a test reaches FBF,
+how the tests that talk to FBF can run without it, how we notice that FBF
+has changed under us, and how we keep personal data out of what we record.
+
+
+\section{Two modes, one test}
+
+The tests fall into two groups, by what they need from FBF.
+\begin{description}
+\item[Offline tests] exercise our own code on inputs written for the test:
+  the form parser, the page merging, the HAR shapes.
+  They need no network and no credentials.
+\item[Service tests] launch FBF from Canvas or send requests to FBF's API,
+  and check what comes back.
+  They are marked [[vcr]].
+\end{description}
+
+The service tests cannot run against a sandbox.
+FBF has no test environment that we can reach, and the only way in is the
+LTI launch from a real Canvas course (\cref{Launch}).
+We use KTH's Canvas course 63874 and its FBF assignment 402780, whose
+students are real people.
+Yet we want [[make test]] to check the code that talks to FBF offline, without
+credentials, and without anyone's data on the screen.
+
+We therefore record the responses once and replay them.
+The service tests run in three modes, with the same test code:
+\begin{description}
+\item[Replay] is the default: [[make test]].
+  Each service test gets its responses from a recording, a \emph{cassette}
+  in [[tests/cassettes]].
+  No request leaves the machine, and no credentials are needed.
+  A test without a cassette is skipped, with the reason.
+\item[Live] is [[make test PYTESTFLAGS=--live]].
+  Every service test runs against Canvas and FBF, and the responses are
+  recorded afresh, but into a private directory outside the project, never
+  over the cassettes in [[tests/cassettes]].
+  Afterwards we compare the structure of the fresh recordings with the ones
+  we replay (\cref{Drift}).
+  This tells us when FBF has changed its private API, which a replay never
+  can; for an API without documentation or announcements, that is the main
+  reason to have the live mode at all.
+\item[Recording] is [[make test PYTESTFLAGS=--record-mode=once]], which
+  records the cassettes that are missing, or [[--record-mode=rewrite]], which
+  records them all again.
+  It talks to Canvas and FBF like a live run but writes to
+  [[tests/cassettes]].
+\end{description}
+A test that changes data in FBF is marked [[mutates]].
+It reaches FBF only when we also give [[--live-writes]]; in replay it
+replays like the others.
+None of the tests in this version writes, but the rule is in place before
+the first one that does.
+
+The cassettes are not in the repository.
+Even pseudonymized, they describe a real course: who viewed which activity
+and when, linked by FBF's identifiers, and whoever holds the key can undo the
+pseudonyms.
+They stay on the machine that recorded them, and [[tests/.gitignore]] keeps
+them out of git.
+Anyone with a Canvas login to a course with an FBF assignment can record their
+own (\cref{RecordingOwn}); without cassettes, the service tests are skipped
+and the offline tests still run.
+
+
+\section{The shared test configuration}
+
+[[pytest]] reads command-line options and shared fixtures from a file
+[[conftest.py]] in the test directory, which we tangle from here.
+The recording itself is done by the [[pytest-recording]] plugin, which wraps
+[[vcrpy]].
+A test marked [[@pytest.mark.vcr]] gets a cassette named after the test,
+and [[--record-mode]] chooses between replaying and recording.
+We add the live mode, the launch for the tests, and the privacy protection.
+
+The scrubbing and the drift comparison come from [[vcr_support.py]].
+It is not ours: it is a helper from the [[testing]] skill for Claude Code,
+committed unchanged in [[tests/]] so that it can be updated from its source
+(the copy is the skill's [[assets/vcr_support.py]] of October 2026, which is
+newer than the copy in [[ladok3]], whose test setup this chapter follows).
+Everything that is specific to Canvas and FBF we pass to it from here, rather
+than editing the copy.
+
+Unlike the other modules, [[conftest.py]] is tangled from \emph{all} chapters,
+as [[schema.py]] is (\cref{Schema}): each chapter that declares names FBF must
+have can also say how to fetch an example of them, in a chunk
+[[<<example fetchers>>]] (\cref{Examples}).
+Since tangling from several files joins all chunks of the same name, the
+chunks of this chapter have names of their own, not the [[<<constants>>]] or
+[[<<functions>>]] that every chapter has.
+<<[[conftest.py]]>>=
+"""Shared pytest configuration for fbf's tests.
+
+Tangled from src/fbf/testing.nw (and the example fetchers of the other
+chapters); edit those files, not this one.
+"""
+import dataclasses
+import hashlib
+import html
+import os
+import re
+import shutil
+import sys
+import urllib.parse
+from pathlib import Path
+
+import pytest
+import vcr as vcrpy
+
+from fbf.api import FBF
+from fbf.launch import launch, parse_page
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import vcr_support  # noqa: E402
+
+pytest_plugins = ["pytester"]
+
+<<constants for the tests>>
+<<pytest options>>
+<<pytest configuration>>
+<<collection rules>>
+<<scrubbing for FBF>>
+<<test fixtures>>
+<<example registry>>
+<<example fetchers>>
+<<checks after the run>>
+@
+
+The configuration is code like any other, and parts of it guard against
+leaking personal data, so it has tests of its own, in [[test_testing.py]].
+They import the functions from [[conftest]], which [[pytest]] has already
+loaded.
+Some of them run [[pytest]] itself on a small test file, through the
+[[pytester]] fixture, which comes in a plugin that we enable above.
+<<test [[testing.py]]>>=
+import json
+import urllib.parse
+
+import pytest
+
+import conftest
+
+<<test functions>>
+@
+
+Replay must never reach the network, not even by mistake.
+In [[pyproject.toml]] we therefore give [[pytest]] the options
+[[--block-network --allowed-hosts=127.0.0.1,::1,localhost]]: any request to
+another host then fails, unless a live run or a recording turns the block off.
+
+
+\section{Choosing the mode}
+
+The two live options are separate because they carry different risks.
+A read test only looks at the data, while a write test changes it.
+<<pytest options>>=
+def pytest_addoption(parser):
+    group = parser.getgroup("fbf")
+    group.addoption(
+        "--live", action="store_true",
+        help="run the service tests against Canvas and FBF, record into a "
+             "private directory and compare with the cassettes")
+    group.addoption(
+        "--live-writes", action="store_true",
+        help="with --live or --record-mode, also run the tests that change "
+             "data in FBF")
+    group.addoption(
+        "--live-dir", default=None,
+        help="where --live records, as --live-dir=PATH "
+             "(default: a private directory under the temporary directory)")
+@
+
+A live run is a recording that goes elsewhere.
+We set the record mode to [[all]], so every request goes to the services,
+and turn the network block off.
+We have to set the options themselves rather than the fixtures, because
+[[pytest-recording]] reads its network block from the options.
+Recording needs the pseudonymization key; without it we refuse to start
+rather than record anyone's data in clear.
+<<pytest configuration>>=
+def pytest_configure(config):
+    config.addinivalue_line(
+        "markers",
+        "mutates: the test changes data in FBF; reaches FBF only with "
+        "--live-writes")
+    config._recorded_dirs = set()
+    if config.getoption("--live"):
+        config.option.record_mode = "all"
+        config.option.block_network = False
+        config._live_dir = live_directory(config)
+        prepare_live_dir(config._live_dir, Path(str(config.rootpath)).resolve())
+    if record_mode_of(config) != "none" \
+            and not os.environ.get(vcr_support.KEY_ENV):
+        pytest.exit(f"refusing to record: set {vcr_support.KEY_ENV} so that "
+                    "personal data is pseudonymized", returncode=2)
+
+
+def record_mode_of(config):
+    """Return the record mode, `none` meaning replay."""
+    return config.getoption("--record-mode") or "none"
+@
+
+The live recordings hold real people's data, pseudonymized, so they go in a
+private directory outside the repository rather than in the shared temporary
+directory.
+The directory name includes a hash of the project's path, so two checkouts
+(such as two git worktrees) don't share one.
+<<pytest configuration>>=
+def live_directory(config):
+    """Return the directory that a live run records into."""
+    root = Path(str(config.rootpath))
+    tag = hashlib.sha256(str(root.resolve()).encode()).hexdigest()[:10]
+    return Path(config.getoption("--live-dir")
+                or vcr_support.private_dir()
+                / f"{root.name}-{tag}-live-cassettes").resolve()
+@
+
+A live run starts with an empty directory, so that recordings from an earlier
+run can't hide that a request is no longer made.
+Emptying a directory is dangerous if the path is mistyped, so we only empty a
+directory that an earlier live run wrote, as shown by a marker file, and we
+never accept a directory that contains the project.
+<<constants for the tests>>=
+LIVE_MARKER_FILE = ".pytest-live-cassettes"
+<<pytest configuration>>=
+def prepare_live_dir(live_dir, root):
+    """Empty `live_dir` for a live run, if an earlier live run made it."""
+    if live_dir == root or live_dir in root.parents:
+        pytest.exit(f"refusing --live-dir={live_dir}: it contains the project",
+                    returncode=2)
+    if live_dir.exists() and any(live_dir.iterdir()):
+        if not (live_dir / LIVE_MARKER_FILE).exists():
+            pytest.exit(f"refusing to empty --live-dir={live_dir}: it has "
+                        "files that an earlier live run did not write",
+                        returncode=2)
+        shutil.rmtree(live_dir)
+    live_dir.mkdir(parents=True, exist_ok=True)
+    (live_dir / LIVE_MARKER_FILE).write_text(
+        "written by pytest --live; safe to delete\n")
+@
+
+Let's verify that a live run empties only its own directory.
+<<test functions>>=
+def test_prepare_live_dir_empties_only_its_own(tmp_path):
+  project = tmp_path / "project"
+  live = tmp_path / "live"
+  conftest.prepare_live_dir(live, project)
+  (live / "old.yaml").write_text("from an earlier live run")
+  conftest.prepare_live_dir(live, project)
+  assert not (live / "old.yaml").exists()
+
+def test_prepare_live_dir_refuses_foreign_files(tmp_path):
+  live = tmp_path / "live"
+  live.mkdir()
+  (live / "precious.txt").write_text("not ours")
+  with pytest.raises(pytest.exit.Exception):
+    conftest.prepare_live_dir(live, tmp_path / "project")
+  assert (live / "precious.txt").exists()
+
+def test_prepare_live_dir_refuses_the_project(tmp_path):
+  with pytest.raises(pytest.exit.Exception):
+    conftest.prepare_live_dir(tmp_path, tmp_path / "project")
+@
+
+A [[mutates]] test is skipped when it would reach FBF, in a live run or
+while recording, unless we asked for writes.
+In replay it runs: then its writes go to the cassette, not to FBF.
+<<collection rules>>=
+def pytest_collection_modifyitems(config, items):
+    talks_to_fbf = record_mode_of(config) != "none"
+    if not talks_to_fbf or config.getoption("--live-writes"):
+        return
+    skip_writes = pytest.mark.skip(
+        reason="changes data in FBF; add --live-writes")
+    for item in items:
+        if "mutates" in item.keywords:
+            item.add_marker(skip_writes)
+@
+
+Let's verify the rule in each mode, by running [[pytest]] on a small test
+file with this configuration.
+The inner run replaces the launch fixture (\cref{TestLaunch}), so it never
+contacts Canvas, whatever mode it is in.
+<<test functions>>=
+INNER_TESTS = """
+import pytest
+
+@pytest.fixture(scope="session", autouse=True)
+def launched():
+  return "the inner run never launches"
+
+@pytest.mark.mutates
+def test_writes():
+  pass
+
+def test_reads():
+  pass
+"""
+
+@pytest.mark.parametrize("options,passed,skipped", [
+  ([], 2, 0),
+  (["--live"], 1, 1),
+  (["--live", "--live-writes"], 2, 0),
+])
+def test_mutates_tests_reach_fbf_only_with_live_writes(
+    pytester, monkeypatch, tmp_path, options, passed, skipped):
+  monkeypatch.setenv("TEST_PSEUDONYM_KEY", "a key for the inner run")
+  pytester.makeconftest(file_text(conftest.__file__))
+  pytester.makepyfile(test_inner=INNER_TESTS)
+  result = pytester.runpytest_inprocess(
+    *options, f"--live-dir={tmp_path / 'live'}", "-p", "no:cacheprovider")
+  result.assert_outcomes(passed=passed, skipped=skipped)
+
+def file_text(path):
+  with open(path, encoding="utf-8") as file:
+    return file.read()
+@
+
+
+\section{The launch for the tests}
+\label{TestLaunch}
+
+Every service test needs FBF tokens, and the only way to get them is the
+launch of \cref{Launch}, which takes half a dozen requests through Canvas and
+FBF.
+We launch once per run, with the Canvas API token that [[canvaslms]] stores,
+and let all tests share the tokens: they are the user's, not the launched
+activity's, so one launch serves every test.
+The test target is a pair of constants.
+<<constants for the tests>>=
+CANVAS_URL = "https://canvas.kth.se"
+COURSE_ID = 63874
+ASSIGNMENT_ID = 402780
+@
+
+\subsection{Launching before any cassette opens}
+
+The shared launch must not end up in a test's cassette.
+Which test happens to run first is an accident of ordering, and that test's
+cassette would then hold a launch that the same test, run alone in replay,
+would not make.
+[[pytest-recording]] opens a test's cassette in a function-scoped fixture,
+and [[pytest]] sets up session-scoped fixtures before function-scoped ones,
+so a session-scoped fixture that launches does so outside every test's
+cassette.
+It must be [[autouse]], because a fixture that a test asks for by name may
+be set up after the cassette is already open.
+
+When there are no stored Canvas credentials, the service tests are skipped
+rather than failed, since the problem is the machine's set-up, not the code.
+The fixture itself must not skip, though: skipping an [[autouse]] fixture
+would skip the offline tests too.
+It returns the reason instead, and the fixtures that the service tests ask
+for skip with it.
+Any other error, such as a [[LaunchError]], is left to fail, because it may
+well be a bug in the launch or a change at Canvas or FBF.
+<<test fixtures>>=
+@pytest.fixture(scope="session")
+def recording(record_mode):
+    """True when the tests talk to Canvas and FBF: live or recording."""
+    return record_mode != "none"
+
+
+@pytest.fixture(scope="session", autouse=True)
+def launched(recording, pytestconfig, pseudonymizer):
+    """The launch that the tests share when they talk to FBF, or the reason
+    why there is none.  Launches before any cassette opens."""
+    if not recording:
+        return "replaying"
+    cassette = recording_dir(pytestconfig, LAUNCH_CASSETTE.parent) \
+        / LAUNCH_CASSETTE.name
+    return log_in_for_tests(
+        lambda: launch_for_tests(cassette, pseudonymizer),
+        into_project=not pytestconfig.getoption("--live"))
+@
+
+Skipping is right for a live run, which records into a directory of its own.
+It is wrong when we record into the project's cassettes.
+With [[--record-mode=rewrite]], [[pytest-recording]] deletes a test's
+cassette when it opens it, and that happens before the [[fbf]] fixture
+learns that there is no launch and skips.
+A run without credentials would then delete the very cassettes that it was
+meant to renew, and still exit successfully, reporting only skips.
+So when we record into the project, missing credentials stop the whole run,
+here, before any cassette opens.
+
+One kind of error we always let through: [[RecursionError]].
+It subclasses [[RuntimeError]], so a broad handler would take a launch that
+loops for a missing login; [[ladok3]] once lost its cassettes that way.
+Our handler catches only [[CredentialsMissing]], which makes that mistake
+impossible, and a test below keeps it so.
+<<test fixtures>>=
+class CredentialsMissing(Exception):
+    """There is no Canvas login to launch FBF with."""
+
+
+def log_in_for_tests(log_in, into_project):
+    """Return what `log_in()` returns, or the reason why there is no login.
+    Stops the run instead when we record into the project's cassettes,
+    which a skipped test could delete."""
+    try:
+        return log_in()
+    except CredentialsMissing as err:
+        if into_project:
+            pytest.exit(f"cannot launch FBF, so nothing is recorded: {err}",
+                        returncode=1)
+        return f"cannot launch FBF: {err}"
+@
+
+Let's verify the three outcomes with a login that fails the way missing
+credentials do, and with one that fails the way a looping login does.
+We inject the failures: the real login would need credentials and Canvas.
+<<test functions>>=
+def no_stored_credentials():
+  raise conftest.CredentialsMissing("no Canvas login")
+
+def test_missing_credentials_stop_a_recording_into_the_project():
+  with pytest.raises(pytest.exit.Exception):
+    conftest.log_in_for_tests(no_stored_credentials, into_project=True)
+
+def test_missing_credentials_skip_the_service_tests_of_a_live_run():
+  reason = conftest.log_in_for_tests(no_stored_credentials,
+                                     into_project=False)
+  assert "no Canvas login" in reason
+
+def test_a_login_that_loops_is_a_bug_not_a_missing_login():
+  def looping_login():
+    raise RecursionError("maximum recursion depth exceeded")
+
+  with pytest.raises(RecursionError):
+    conftest.log_in_for_tests(looping_login, into_project=False)
+@
+
+The credentials are those of [[canvaslms]], which keeps them in the keyring,
+the environment or its configuration.
+[[canvaslms]] is not a dependency of [[fbf]] itself, so a machine without it
+simply has no credentials.
+We take only the token: the cassettes are recorded against [[CANVAS_URL]],
+and replay must ask for the same host.
+<<test fixtures>>=
+def canvas_token_for_tests():
+    """Return the Canvas API token that `canvaslms` stores."""
+    try:
+        from canvaslms.cli.login import load_credentials
+    except ImportError as err:
+        raise CredentialsMissing("canvaslms is not installed") from err
+    _, token = load_credentials({})
+    if not token:
+        raise CredentialsMissing("no Canvas login; run `canvaslms login`")
+    return token
+@
+
+\subsection{Replaying the launch}
+
+A test in replay needs tokens too, or rather it needs an [[FBFLogin]]: the
+tokens can be anything, since the cassettes keep no [[Authorization]]
+header, but the API URL and the UUIDs of the course and the activity must be
+the ones the requests were recorded with.
+We could write those into the code, but they would go stale with every new
+recording.
+Instead the shared launch is itself recorded, into a cassette of its own,
+and replay replays it: the replayed launch runs our real launch code and
+ends with the same API URL and UUIDs, and with placeholder tokens.
+
+The live launch records into a partial file and replaces the old cassette
+only when the launch succeeded.
+In [[all]] mode [[vcrpy]] keeps the interactions of an existing cassette that
+the new run did not repeat, so writing over the old file directly would mix
+two launches; and a launch that failed halfway must not destroy the one that
+worked.
+<<constants for the tests>>=
+TESTS_DIR = Path(__file__).resolve().parent
+LAUNCH_CASSETTE = TESTS_DIR / "cassettes" / "session" / "launch.yaml"
+REPLAY_TOKEN = "replay-token"
+<<test fixtures>>=
+@dataclasses.dataclass
+class Launched:
+    """The live launch that the tests share."""
+
+    canvas_token: str
+    login: object
+
+
+def launch_for_tests(cassette, pseudonymizer):
+    """Launch FBF for real, recording the launch into `cassette`."""
+    canvas_token = canvas_token_for_tests()
+    cassette.parent.mkdir(parents=True, exist_ok=True)
+    partial = cassette.with_suffix(".partial.yaml")
+    try:
+        with launch_recorder(pseudonymizer).use_cassette(
+                str(partial), record_mode="all"):
+            login = launch(CANVAS_URL, canvas_token, COURSE_ID, ASSIGNMENT_ID)
+        partial.replace(cassette)
+    finally:
+        partial.unlink(missing_ok=True)
+    return Launched(canvas_token, login)
+
+
+def launch_recorder(pseudonymizer):
+    """Return a `vcrpy` recorder configured like the tests' cassettes."""
+    return vcrpy.VCR(**pseudonymizer.vcr_config())
+@
+
+The replayed launch is made once per run, when the first test needs it.
+That is inside the test's own cassette, which is already open; [[vcrpy]]
+lets the launch cassette take over for the duration of the launch and then
+hands back.
+In replay the network is blocked anyway, so a launch request that the
+cassette lacks fails instead of reaching Canvas.
+<<test fixtures>>=
+@pytest.fixture(scope="session")
+def replayed_login(pseudonymizer):
+    """The `FBFLogin` of the recorded launch, replayed."""
+    if not LAUNCH_CASSETTE.exists():
+        pytest.skip("no recorded launch; record with --record-mode=once")
+    with launch_recorder(pseudonymizer).use_cassette(
+            str(LAUNCH_CASSETTE), record_mode="none"):
+        return launch(CANVAS_URL, REPLAY_TOKEN, COURSE_ID, ASSIGNMENT_ID)
+@
+
+\subsection{What a service test asks for}
+
+The tests ask for [[fbf]], a client for FBF, or for [[canvas_token]], if they
+launch themselves.
+They get whatever fits the mode.
+In replay, a test without a cassette is skipped: without one, its first
+request would only fail on the network block.
+A test that uses these fixtures must be marked [[vcr]], though, or it is never
+recorded: it would be skipped in replay for ever and talk to FBF unrecorded
+in a live run, outside the drift check.
+We fail such a test rather than let it skip quietly.
+<<test fixtures>>=
+def require_service(request, recording, launched):
+    """Fail, skip or go on with a service test, as its mode requires.
+    Returns the live launch, or `None` in replay."""
+    if request.node.get_closest_marker("vcr") is None:
+        pytest.fail("a test that talks to Canvas or FBF must be marked vcr")
+    if recording:
+        if isinstance(launched, str):
+            pytest.skip(launched)
+        return launched
+    cassette = Path(request.getfixturevalue("vcr_cassette_dir")) \
+        / f"{request.getfixturevalue('default_cassette_name')}.yaml"
+    if not cassette.exists():
+        pytest.skip("no recording; record it with --record-mode=once, "
+                    "or run with --live")
+    return None
+@
+
+Each test gets a client of its own, so that no state carries over from one
+test to the next.
+What the clients share differs by mode.
+In a live run they share the launch's [[FBFLogin]]: when a test renews the
+tokens, FBF also replaces the refresh token, so the old one may no longer
+work, and the next test must see the new tokens.
+In replay each client gets a copy of the replayed login, so that a test that
+renews (and thereby replaces the placeholders) changes nothing for the next.
+<<test fixtures>>=
+@pytest.fixture
+def fbf(request, recording, launched):
+    """A client for FBF: on the live launch's tokens when talking to FBF, on
+    the replayed launch's otherwise."""
+    live = require_service(request, recording, launched)
+    if live:
+        return FBF(live.login)
+    return FBF(dataclasses.replace(request.getfixturevalue("replayed_login")))
+
+
+@pytest.fixture
+def canvas_token(request, recording, launched):
+    """The Canvas API token for a test that launches FBF itself."""
+    live = require_service(request, recording, launched)
+    return live.canvas_token if live else REPLAY_TOKEN
+@
+
+Finally, in replay we check that the test made every request its cassette
+holds.
+By default [[vcrpy]] only answers the requests that come; it doesn't notice
+one that never comes.
+A change in our code that drops a request, say a page or a renewal, would
+then pass unnoticed, and so would a write test whose cleanup was never sent.
+We name the requests that were not made, with their identifiers replaced, as
+in the drift report.
+<<test fixtures>>=
+@pytest.fixture(autouse=True)
+def cassette_fully_played(vcr, recording):
+    """In replay, every recorded request must be made again."""
+    yield
+    if vcr is not None and not recording and not vcr.all_played:
+        unplayed = [vcr_support.request_key({"method": r.method,
+                                             "uri": r.uri})
+                    for i, r in enumerate(vcr.requests)
+                    if not vcr.play_counts[i]]
+        pytest.fail(f"{len(unplayed)} recorded request(s) not made in "
+                    "replay: " + ", ".join(unplayed), pytrace=False)
+@
+
+Let's verify the check with a test that makes one of the two requests in its
+cassette.
+The cassette is written by hand, but it only has to look recorded: the test
+is about our check, not about any service, and its host is reserved for
+examples.
+<<test functions>>=
+SKIPPING_TEST = """
+import pytest
+import requests
+
+@pytest.mark.vcr
+def test_makes_one_of_two():
+  requests.get("http://example.com/a")
+"""
+
+def interaction(path):
+  return {"request": {"method": "GET", "uri": f"http://example.com{path}",
+                      "body": None, "headers": {}},
+          "response": {"status": {"code": 200, "message": "OK"},
+                       "headers": {}, "body": {"string": ""}}}
+
+def test_replay_fails_a_test_that_skips_a_recorded_request(pytester):
+  pytester.makeconftest(file_text(conftest.__file__))
+  pytester.makepyfile(test_inner=SKIPPING_TEST)
+  cassette = pytester.path / "cassettes" / "test_inner"
+  cassette.mkdir(parents=True)
+  (cassette / "test_makes_one_of_two.yaml").write_text(json.dumps(
+    {"version": 1, "interactions": [interaction("/a"), interaction("/b")]}))
+  result = pytester.runpytest_inprocess("-p", "no:cacheprovider")
+  result.assert_outcomes(passed=1, errors=1)
+  result.stdout.fnmatch_lines(["*1 recorded request(s) not made*/b*"])
+@
+
+
+\section{Recording}
+
+Each test module gets its own cassette directory under [[tests/cassettes]],
+named after the module, and the shared launch gets [[tests/cassettes/session]].
+In a live run the same relative paths are used, but under the live
+directory.
+We note which directories were written, so that we can scan them and, in a
+live run, compare them after the run.
+<<test fixtures>>=
+def recording_dir(config, committed):
+    """Return the directory to record the cassettes of `committed` into."""
+    if config.getoption("--live"):
+        target = config._live_dir / committed.relative_to(config.rootpath)
+        config._recorded_dirs.add((committed, target))
+        return target
+    if record_mode_of(config) != "none":
+        config._recorded_dirs.add((committed, committed))
+    return committed
+
+
+@pytest.fixture(scope="module")
+def vcr_cassette_dir(request):
+    module = Path(request.node.path)
+    committed = module.parent / "cassettes" / module.stem
+    return str(recording_dir(request.config, committed))
+@
+
+
+\subsection{Pseudonymization}
+\label{Pseudonymization}
+
+The responses we record are about real people.
+[[vcr_support]] scrubs each response before it is written: secrets such as
+cookies and tokens are removed, names, email addresses and usernames are
+replaced by pseudonyms, and free text is replaced wholesale, since prose can
+name anyone.
+The pseudonyms are keyed hashes, so the same person gets the same pseudonym
+in every cassette, and only someone with the key can link a pseudonym to a
+person.
+The key, in the environment variable [[TEST_PSEUDONYM_KEY]], must therefore
+never be committed; it lives in the keyring (\cref{RecordingOwn}).
+It must also stay the same between recordings, or every pseudonym changes and
+a re-recording becomes impossible to review.
+
+[[vcr_support]] knows Canvas's field names, which are its defaults.
+FBF needs more, for four reasons, which the rest of this section takes in
+turn.
+\begin{enumerate}
+\item FBF writes its attribute names in kebab-case.
+\item FBF is a JSON:API, where a person's name sits in an [[attributes]]
+  object that says nothing about being a person.
+\item The launch passes its secrets in URLs, forms and JSON values, not only
+  in the headers and query parameters that [[vcr_support]] filters.
+\item The launch pages are HTML, which [[vcr_support]] does not scrub by key.
+\end{enumerate}
+We teach [[vcr_support]]'s pseudonymizer these in a subclass.
+<<scrubbing for FBF>>=
+class FBFPseudonymizer(vcr_support.Pseudonymizer):
+    """The pseudonymizer of `vcr_support`, taught Canvas's and FBF's ways."""
+
+    def __init__(self, key, originals_path=None):
+        super().__init__(
+            key, originals_path,
+            name_keys=FBF_NAME_KEYS, email_keys=FBF_EMAIL_KEYS,
+            login_keys=FBF_LOGIN_KEYS, free_text_keys=FBF_FREE_TEXT_KEYS,
+            url_identity_keys=FBF_URL_IDENTITY_KEYS)
+
+    <<[[FBFPseudonymizer]] methods>>
+@
+
+The pseudonymizer notes every original value it replaced, in a private file
+outside the repository, so that the scan after the run (\cref{Drift}) can
+look for any of them that slipped through elsewhere.
+In replay nothing is written, and any key will do, since nothing is
+pseudonymized.
+The [[vcrpy]] configuration comes from the pseudonymizer, as in
+[[vcr_support]]; it matches requests on their bodies too, so that a write
+test in replay must send exactly what was recorded.
+<<test fixtures>>=
+@pytest.fixture(scope="session")
+def pseudonymizer(request, recording):
+    key = os.environ.get(vcr_support.KEY_ENV, "")
+    originals = Path(os.environ.get(vcr_support.ORIGINALS_ENV)
+                     or vcr_support.default_originals_path(
+                         request.config.rootpath))
+    request.config._originals_path = originals
+    return FBFPseudonymizer((key or "replay-only").encode(),
+                            originals if recording else None)
+
+
+@pytest.fixture
+def vcr_config(pseudonymizer):
+    return pseudonymizer.vcr_config()
+@
+
+\subsubsection{Field names in kebab-case}
+
+[[vcr_support]] matches keys such as [[first_name]] and [[avatar_url]].
+FBF calls the same things [[first-name]] and [[avatar-url]], so for each of
+[[vcr_support]]'s key lists we add the kebab-case spelling of every key.
+On top of that come FBF's own fields:
+\begin{description}
+\item[[[address]] ] is the address of an [[emails]] resource.
+  [[vcr_support]] counts it as a postal address and replaces it with a
+  placeholder; as an email key it gets a pseudonymous email address instead,
+  which keeps the type of value and is the same in every cassette.
+\item[[[body]], [[body-rendered]] ] are the texts of comments and answers,
+  and [[body-rendered]] their HTML.
+\item[[[solution]], [[solution-rendered]] ] are a teacher's model answer.
+\item[[[description]], [[description-rendered]] ] are the instructions of an
+  activity or a task.
+  They are written by teachers, not students, but they are free text and
+  may name anyone.
+\end{description}
+Titles we keep: the [[title]] of an activity is course content, it names the
+assignment rather than a person, and the tests may want to read it.
+<<scrubbing for FBF>>=
+def kebab(keys):
+    """Return `keys` together with their kebab-case spellings."""
+    return set(keys) | {key.replace("_", "-") for key in keys}
+
+
+FBF_NAME_KEYS = kebab(vcr_support.NAME_KEYS)
+FBF_EMAIL_KEYS = kebab(vcr_support.EMAIL_KEYS) | {"address"}
+FBF_LOGIN_KEYS = kebab(vcr_support.LOGIN_KEYS)
+FBF_URL_IDENTITY_KEYS = kebab(vcr_support.URL_IDENTITY_KEYS)
+FBF_FREE_TEXT_KEYS = kebab(vcr_support.FREE_TEXT_KEYS) | {
+    "body-rendered", "solution", "solution-rendered",
+    "description-rendered"}
+@
+
+\subsubsection{People in JSON:API}
+
+[[vcr_support]] replaces a [[name]] only in an object that looks like a
+person: one that also has an email or a login, or that sits under a key such
+as [[user]] or [[author]].
+Otherwise every course, file and activity name would be taken for a person's.
+In JSON:API, a user is
+\begin{center}
+[[{"type": "users", "id": ..., "attributes": {"name": ..., ...}}]]
+\end{center}
+and its [[attributes]] object has neither: the [[name]] would pass through.
+What does say \enquote{person} is the [[type]] of the resource, so for the
+resource types in [[FBF_PERSON_TYPES]] we scrub the attributes as if they sat
+under [[user]].
+(The emails of a user are separate [[emails]] resources, which the
+[[address]] key above covers.)
+
+A user also has a [[zendesk-hash]], which FBF's web app hands to its help
+desk to prove who the user is: a credential, not data.
+The launch and the token renewal carry tokens as JSON values too.
+Such values are replaced by a placeholder wherever their key occurs.
+<<scrubbing for FBF>>=
+FBF_PERSON_TYPES = {"users"}
+FBF_SECRET_KEYS = kebab({
+    "access_token", "refresh_token", "id_token", "session_token",
+    "login_hint", "lti_message_hint", "authenticity_token", "csrf_token",
+    "secure_params", "zendesk_hash"})
+
+
+def is_person_resource(obj):
+    """True if `obj` is a JSON:API resource that describes a person."""
+    return (obj.get("type") in FBF_PERSON_TYPES
+            and isinstance(obj.get("attributes"), dict))
+
+
+def redact_secret(key, value):
+    """Return a placeholder for `value` if `key` names a secret."""
+    if str(key).lower() in FBF_SECRET_KEYS and isinstance(value, str) and value:
+        return vcr_support.SECRET_PLACEHOLDER
+    return value
+@
+
+[[vcr_support]] walks the JSON in a method [[_collect]], which takes the key
+that an object sits under; we step in before it.
+Overriding a private method ties us to the internals of [[vcr_support]], so
+the tests below check the result, not the mechanism: if a new copy of
+[[vcr_support]] works differently, they fail.
+<<[[FBFPseudonymizer]] methods>>=
+def _collect(self, obj, parent=None):
+    if isinstance(obj, dict):
+        obj = {key: redact_secret(key, value) for key, value in obj.items()}
+        if is_person_resource(obj):
+            return {key: self._collect(
+                        value, "user" if key == "attributes" else str(key).lower())
+                    for key, value in obj.items()}
+    return super()._collect(obj, parent)
+@
+
+Let's verify each field we added, with a document as FBF would send it but
+with values made up for the test.
+The tests use a pseudonymizer of their own, not the one of the run, which
+would note the made-up values as originals while recording and then look for
+them in the real cassettes.
+None of the personal values may survive, the secrets must become the
+placeholder, and the title must stay as it is.
+The user has only attributes that FBF's users have.
+An [[avatar-url]] among them would by itself make the attributes look like a
+person's, and the test would pass with the rule for [[users]] broken, so the
+avatar sits in a resource of its own.
+<<test functions>>=
+@pytest.fixture
+def scrubber():
+  return conftest.FBFPseudonymizer(b"a key for the tests")
+
+FBF_DOCUMENT = {
+  "data": {"type": "users", "id": "u1", "attributes": {
+    "name": "Anna Andersson", "zendesk-hash": "0a1b2c3d4e5f",
+    "bot": False, "preview": False}},
+  "included": [
+    {"type": "media", "id": "m1",
+     "attributes": {"avatar-url": "https://example.com/anna.png"}},
+    {"type": "emails", "id": "e1",
+     "attributes": {"address": "anna@kth.se"}},
+    {"type": "comments", "id": "c1",
+     "attributes": {"body": "Ask Bo Berg.", "body-rendered": "<p>Ask</p>"}},
+    {"type": "open-questions", "id": "q1",
+     "attributes": {"solution": "Fortytwo",
+                    "solution-rendered": "<p>Fortytwo</p>",
+                    "description-rendered": "<p>Do it</p>"}},
+    {"type": "activities", "id": "a1",
+     "attributes": {"title": "Peer review 1", "name": "Peer review 1"}},
+  ],
+}
+
+def test_recordings_replace_fbfs_own_fields(scrubber):
+  scrubbed = scrubber.scrub_json(json.loads(json.dumps(FBF_DOCUMENT)))
+  text = json.dumps(scrubbed)
+  for value in ("Anna", "Andersson", "anna@kth.se", "0a1b2c3d4e5f",
+                "anna.png", "Bo Berg", "<p>", "Fortytwo"):
+    assert value not in text, value
+  user = scrubbed["data"]["attributes"]
+  assert user["zendesk-hash"] == "redacted"
+  activity = scrubbed["included"][-1]["attributes"]
+  assert activity == {"title": "Peer review 1", "name": "Peer review 1"}
+@
+
+\subsubsection{Secrets in URLs}
+
+The launch passes one-time secrets in URLs.
+Canvas's sessionless launch URL (hop~0) carries a [[verifier]] and the
+[[session_token]] that logs the session in, inside a JSON value; FBF's
+redirect to Canvas (hop~2) carries [[login_hint]], [[lti_message_hint]],
+[[state]] and [[nonce]], in a [[Location]] header.
+[[vcrpy]] removes secret parameters from the URLs of the recorded requests,
+but it never looks at response bodies or headers.
+We extend its list of parameters and, in every string that the pseudonymizer
+scrubs, replace the value of such a parameter with the placeholder.
+We keep the parameter itself: hop~0 checks that the URL has a
+[[session_token]], and the replayed launch must pass that check.
+In replay the placeholder then appears in the requests that follow the URL,
+and since [[vcrpy]] removes the parameter from them before matching, as it
+did when recording, they still match.
+<<scrubbing for FBF>>=
+SECRET_PARAMS = vcr_support.SECRET_QUERY_PARAMS + [
+    "login_hint", "lti_message_hint", "state", "nonce", "verifier",
+    "authenticity_token"]
+URL_SECRET = re.compile(
+    r"(?i)([?&;])(" + "|".join(map(re.escape, SECRET_PARAMS)) + r")="
+    r"([^&#\s\"'<>\\]+)")
+
+
+def redact_url_secrets(text):
+    """Replace the values of secret parameters in the URLs in `text`."""
+    return URL_SECRET.sub(
+        lambda match: f"{match[1]}{match[2]}={vcr_support.SECRET_PLACEHOLDER}",
+        text)
+<<[[FBFPseudonymizer]] methods>>=
+def scrub_text(self, text):
+    return redact_url_secrets(super().scrub_text(text))
+
+
+def vcr_config(self):
+    config = super().vcr_config()
+    config["filter_query_parameters"] = SECRET_PARAMS
+    config["filter_post_data_parameters"] = SECRET_PARAMS
+    return config
+@
+
+Let's verify it on a sessionless launch response with made-up values.
+<<test functions>>=
+def test_recordings_redact_url_secrets_but_keep_the_parameters(scrubber):
+  url = ("https://canvas.example.com/courses/1/external_tools"
+         "/sessionless_launch?verifier=Abc123def456&session_token=Xyz789"
+         "&launch_type=assessment")
+  scrubbed = scrubber.scrub_json({"id": 1, "url": url})["url"]
+  query = urllib.parse.parse_qs(urllib.parse.urlsplit(scrubbed).query)
+  assert query == {"verifier": ["redacted"], "session_token": ["redacted"],
+                   "launch_type": ["assessment"]}
+@
+
+\subsubsection{The launch pages}
+
+Hops 1 to 3 answer with HTML pages: Canvas's assignment page, the form that
+carries the [[id_token]], and FBF's web app.
+[[vcr_support]] scrubs HTML only for the names and emails that it has already
+learned from JSON, and a Canvas page holds much more: the logged-in user's
+name and settings in its JavaScript, CSRF tokens, links.
+Rather than find and remove all that, we keep only what the launch reads: the
+forms with their fields, and the [[<meta>]] tags.
+Keeping a list of what may stay is the safer direction: when Canvas adds
+something to its pages, it is dropped rather than recorded.
+We build the reduced page, the \emph{skeleton}, with the parser of the launch
+itself (\cref{Launch}), so it holds exactly what the launch can see.
+
+In the skeleton, a form field keeps its value only if it is in
+[[KEPT_FORM_FIELDS]], which names the fields of the two launch forms that
+identify the tool and the course rather than the user or the session; the
+other fields keep their names but get the placeholder.
+The same goes for the [[<meta>]] tags, of which the launch reads only
+[[api-url]].
+<<scrubbing for FBF>>=
+KEPT_FORM_FIELDS = {
+    "canvas_environment", "canvas_region", "client_id", "grant_type", "iss",
+    "lti_deployment_id", "lti_storage_target", "target_link_uri", "utf8"}
+KEPT_META = {"api-url"}
+
+
+def html_skeleton(text):
+    """Return the forms and meta tags of the HTML page `text`, with the
+    values that may identify someone replaced."""
+    page = parse_page(text)
+    lines = ["<!DOCTYPE html>", "<html><head>"]
+    lines += [tag("meta", name=name, content=kept(name, content, KEPT_META))
+              for name, content in page.meta.items()]
+    lines.append("</head><body>")
+    for form in page.forms:
+        lines.append(tag("form", action=redact_url_secrets(form.action),
+                         method=form.method))
+        lines += [tag("input", type="hidden", name=name,
+                      value=kept(name, value, KEPT_FORM_FIELDS))
+                  for name, value in form.fields.items()]
+        lines.append("</form>")
+    lines.append("</body></html>")
+    return "\n".join(lines) + "\n"
+
+
+def kept(name, value, names):
+    """Return `value` if `name` is in `names`, else the placeholder."""
+    return (value or "") if name in names else vcr_support.SECRET_PLACEHOLDER
+
+
+def tag(element, **attributes):
+    """Return an HTML start tag."""
+    return f"<{element}" + "".join(
+        f' {name}="{html.escape(value)}"'
+        for name, value in attributes.items()) + ">"
+@
+
+The forms are submitted, so the same fields appear again in the bodies of
+the requests that follow.
+There we treat them the same way: a field outside [[KEPT_FORM_FIELDS]] gets
+the placeholder.
+This also makes replay work.
+Requests match on their bodies, and in replay the launch submits the
+skeleton's placeholders where the recording submitted the real values; since
+[[vcrpy]] runs this scrubbing on a request before matching it, as it did
+when recording, both become the same body.
+<<scrubbing for FBF>>=
+def is_form(request):
+    """True if `request` has a form-encoded body."""
+    return "application/x-www-form-urlencoded" in (
+        request.headers.get("Content-Type") or "")
+
+
+def keep_form_fields(body):
+    """Return the form-encoded `body` with the values that may identify
+    someone replaced."""
+    text = body.decode("utf-8") if isinstance(body, bytes) else body
+    fields = urllib.parse.parse_qsl(text, keep_blank_values=True)
+    return urllib.parse.urlencode(
+        [(name, kept(name, value, KEPT_FORM_FIELDS))
+         for name, value in fields]).encode("utf-8")
+<<[[FBFPseudonymizer]] methods>>=
+def before_record_request(self, request):
+    if request.body and is_form(request):
+        request.body = keep_form_fields(request.body)
+    return super().before_record_request(request)
+@
+
+The response headers get the same treatment as the pages: we keep the few
+that a client needs, and [[vcr_support]] then replaces the values of the
+cookies and scrubs the [[Location]].
+The others would only tell a reader about the session (Canvas sends request
+and session identifiers), and none of our code reads them.
+<<scrubbing for FBF>>=
+KEPT_RESPONSE_HEADERS = {"content-type", "content-length", "location",
+                         "set-cookie"}
+<<[[FBFPseudonymizer]] methods>>=
+def before_record_response(self, response):
+    headers = response.get("headers", {})
+    for name in list(headers):
+        if name.lower() not in KEPT_RESPONSE_HEADERS:
+            del headers[name]
+    content_type = " ".join(
+        value for name, values in headers.items()
+        if name.lower() == "content-type" for value in values)
+    body = response.get("body", {})
+    if "text/html" in content_type and body.get("string"):
+        text = body["string"]
+        was_bytes = isinstance(text, bytes)
+        if was_bytes:
+            text = text.decode("utf-8", errors="replace")
+        text = html_skeleton(text)
+        body["string"] = text.encode("utf-8") if was_bytes else text
+    return super().before_record_response(response)
+@
+
+Let's verify the skeleton on a page like Canvas's, with made-up values: a
+script naming the user, a CSRF token, the tool form with an identity hint,
+and the API URL.
+The launch must find the same form and API URL in the skeleton as in the
+page, but none of the other values.
+<<test functions>>=
+CANVAS_PAGE = """<!DOCTYPE html><html><head>
+<meta name="csrf-token" content="Q1w2e3r4t5y6u7i8o9p0">
+<meta name="api-url" content="https://api.example.com">
+<script>ENV = {"current_user": {"display_name": "Anna Andersson"}}</script>
+</head><body>
+<form action="https://api.example.com/v1/lti/login" method="POST">
+  <input type="hidden" name="iss" value="https://canvas.instructure.com">
+  <input type="hidden" name="login_hint" value="a1b2c3d4e5">
+</form></body></html>"""
+
+def recorded_response(body, **headers):
+  headers = {"Content-Type": ["text/html; charset=utf-8"], **headers}
+  return {"status": {"code": 200, "message": "OK"}, "headers": headers,
+          "body": {"string": body.encode("utf-8")}}
+
+def test_recordings_keep_only_the_skeleton_of_pages(scrubber):
+  response = scrubber.before_record_response(
+    recorded_response(CANVAS_PAGE, **{"X-Session-Id": ["s3ss10n"]}))
+  assert list(response["headers"]) == ["Content-Type"]
+  text = response["body"]["string"].decode("utf-8")
+  for value in ("Anna", "Q1w2e3r4t5y6u7i8o9p0", "a1b2c3d4e5"):
+    assert value not in text, value
+  page = conftest.parse_page(text)
+  form = page.forms[0]
+  assert form.action == "https://api.example.com/v1/lti/login"
+  assert form.fields == {"iss": "https://canvas.instructure.com",
+                         "login_hint": "redacted"}
+  assert page.meta == {"csrf-token": "redacted",
+                       "api-url": "https://api.example.com"}
+@
+
+The redirects carry their secrets in the [[Location]] header and their
+session in the cookies; the [[Location]] must still lead to the same place,
+and each cookie must still be set, with the placeholder as its value.
+<<test functions>>=
+def test_recordings_redact_redirects_and_cookies(scrubber):
+  response = scrubber.before_record_response(recorded_response(
+    "", **{"Location": ["https://canvas.example.com/api/lti/authorize"
+                        "?state=Abc123def456&client_id=1000"],
+           "Set-Cookie": ["access_token=eyJabc; path=/; secure"]}))
+  headers = response["headers"]
+  assert headers["Location"] == [
+    "https://canvas.example.com/api/lti/authorize"
+    "?state=redacted&client_id=1000"]
+  assert headers["Set-Cookie"] == ["access_token=redacted; path=/; secure"]
+@
+
+When the launch submits a form, the recorded body and the replayed one must
+come out the same, although the replayed one carries placeholders.
+The field we use is one that Canvas might add some day: it is in no list of
+secrets, so only keeping [[KEPT_FORM_FIELDS]] and nothing else removes its
+value.
+<<test functions>>=
+def form_request(fields):
+  import vcr.request
+  return vcr.request.Request(
+    "POST", "https://api.example.com/v1/lti/login",
+    urllib.parse.urlencode(fields),
+    {"Content-Type": "application/x-www-form-urlencoded"})
+
+def test_recorded_and_replayed_form_bodies_match(scrubber):
+  recorded = scrubber.before_record_request(form_request(
+    {"iss": "https://canvas.instructure.com", "new_hint": "a1b2c3d4e5"}))
+  replayed = scrubber.before_record_request(form_request(
+    {"iss": "https://canvas.instructure.com", "new_hint": "redacted"}))
+  assert recorded.body == replayed.body
+  assert b"a1b2c3d4e5" not in recorded.body
+@
+
+
+\section{An example of every type we depend on}
+\label{Examples}
+
+\Cref{Schema} declares the names of attributes and relationships that our
+code reads, type by type, and the contract test there checks each of them
+against FBF.
+To check a type, the test needs a resource of that type, and how to find one
+differs from type to type: a placement hangs off the launched activity, a
+comment off a video activity somewhere in the course.
+The chapter that declares a type knows how to find it, so it also registers
+a function that fetches an example, in a chunk [[<<example fetchers>>]]:
+\begin{verbatim}
+@example("lti/placement")
+def placement_of_the_launched_activity(fbf, launched):
+    ...
+    return placement
+\end{verbatim}
+A fetcher gets the test's [[FBF]] client and the [[FBFLogin]] of the launch,
+whose [[course_uuid]] and [[activity_uuid]] say where to start looking, and
+returns one resource.
+It runs in a service test, so its requests are recorded and replayed like
+any other.
+
+The registry is a dictionary from type to fetcher.
+Registering a type twice is a mistake, likely a copied chunk, and we refuse
+it rather than let the later fetcher silently win.
+<<example registry>>=
+EXAMPLES = {}
+
+
+def example(kind):
+    """Register the decorated function as the fetcher of an example `kind`."""
+    def register(fetch):
+        if kind in EXAMPLES:
+            raise ValueError(f"two example fetchers for {kind!r}")
+        EXAMPLES[kind] = fetch
+        return fetch
+    return register
+@
+
+The chunk starts empty here; the chapters add their fetchers.
+<<example fetchers>>=
+# The example fetchers of the chapters follow.
+@
+
+<<test functions>>=
+def test_example_refuses_a_second_fetcher_for_a_type(monkeypatch):
+  monkeypatch.setattr(conftest, "EXAMPLES", {})
+  conftest.example("test-type")(lambda fbf, launched: None)
+  with pytest.raises(ValueError, match="test-type"):
+    conftest.example("test-type")(lambda fbf, launched: None)
+@
+
+
+\section{Checks after the run}
+\label{Drift}
+
+After a run that recorded anything, we scan what was written for personal
+data and secrets: every original value that the pseudonymizer replaced, and
+anything shaped like an email address, a personnummer, a JWT or a token.
+A hit fails the run and is reported as a file, a line and a redacted stub,
+never the value.
+
+After a live run we also compare the fresh recordings with the ones we
+replay.
+The comparison looks at structure only: status codes, content types, and the
+paths and types of the keys in the JSON bodies, never the values.
+A removed key, a changed type or a request that is no longer made is
+\emph{drift}: the cassettes no longer describe FBF, and the tests that
+replay them may pass on behaviour that FBF has dropped.
+Drift fails the run.
+The fix is to adapt the code if needed and then record the affected tests
+again with [[--record-mode=rewrite -k]] \emph{test}, never to edit a
+cassette by hand.
+For the launch pages, whose skeletons are HTML, the comparison sees only the
+status and the content type; a changed form is caught by the launch itself,
+whose [[LaunchError]] names the hop (\cref{Launch}).
+<<checks after the run>>=
+def pytest_sessionfinish(session, exitstatus):
+    config = session.config
+    pairs = getattr(config, "_recorded_dirs", set())
+    if not pairs:
+        return
+    reporter = config.pluginmanager.get_plugin("terminalreporter")
+
+    def write(message, **markup):
+        if reporter:
+            reporter.write_line(message, **markup)
+        else:
+            print(message)
+
+    <<scan the recordings for personal data>>
+    if config.getoption("--live"):
+        <<compare the live recordings with the cassettes>>
+@
+
+The scan takes any long run of letters and digits in a URL for a token,
+since capability links look like that.
+FBF's URLs are full of UUIDs, of the course, the activity and the LTI
+environment of the launch, and a UUID has both letters and digits, so the
+first recording reported every one of them.
+They are identifiers, not credentials: FBF answers only requests that carry
+a bearer token.
+So we allow hits that are exactly a UUID, and only those; a token that
+merely contains one is still reported.
+<<constants for the tests>>=
+ALLOWED_HITS = ["re:[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}"
+                "-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"]
+<<scan the recordings for personal data>>=
+originals = vcr_support.Needles(
+    vcr_support.read_list(getattr(config, "_originals_path", None)))
+leaks = []
+for _, written in sorted(pairs):
+    for path in vcr_support.iter_files([written]):
+        if path.name != LIVE_MARKER_FILE:
+            leaks += [(path, where, kind, hit) for where, kind, hit
+                      in vcr_support.scan_file(path, originals,
+                                               allow=ALLOWED_HITS)]
+if leaks:
+    write("PRIVACY: the recordings contain personal data or secrets (values "
+          "redacted below). Extend the key lists in testing.nw, delete the "
+          "cassettes, and record again.", red=True)
+    for path, where, kind, hit in leaks:
+        write(f"  {path}:{where}: {kind} {hit}")
+    session.exitstatus = 1
+@
+
+<<compare the live recordings with the cassettes>>=
+drift = []
+for committed, live in sorted(pairs):
+    if committed.exists() and live.exists():
+        drift += vcr_support.compare_directories(committed, live)
+for severity, name, key, message in drift:
+    if message != "not re-recorded in the live run":
+        write(f"  {severity}: {name} {key}: {message}",
+              red=severity == "drift")
+if any(severity == "drift" for severity, *_ in drift):
+    write("DRIFT: FBF or Canvas no longer matches the cassettes. Fix the "
+          "code if needed, then record the affected tests again with "
+          "--record-mode=rewrite -k <test> and review the diff.", red=True)
+    session.exitstatus = 1
+else:
+    write(f"live: no structural drift ({config._live_dir})", green=True)
+@
+
+
+\section{Recording your own cassettes}
+\label{RecordingOwn}
+
+To record, we need a Canvas login through [[canvaslms login]], with access to
+the course and assignment of [[CANVAS_URL]], [[COURSE_ID]] and
+[[ASSIGNMENT_ID]], and a pseudonymization key.
+Any long random string will do as a key, but it must stay the same between
+recordings and it must never be written to the repository or printed.
+With GNOME Keyring we can create one without ever seeing it:
+\begin{verbatim}
+python3 -c "import secrets; print(secrets.token_urlsafe(32), end='')" \
+  | secret-tool store --label='fbf test pseudonymization key' \
+      service fbf key test-pseudonym
+\end{verbatim}
+Then we record the cassettes that are missing, reading the key from the
+keyring for this command only:
+\begin{verbatim}
+TEST_PSEUDONYM_KEY="$(secret-tool lookup service fbf key test-pseudonym)" \
+  make test PYTESTFLAGS=--record-mode=once
+\end{verbatim}
+A live run takes the key the same way, with [[PYTESTFLAGS=--live]].
+The recording fails if the scan afterwards finds personal data
+(\cref{Drift}); then extend the key lists in \cref{Pseudonymization},
+delete the cassettes and record again.
+Before trusting new cassettes, scan them once more with the [[testing]]
+skill's [[scan_leaks.py]], which also takes a list of names to look for.

@@ -16,17 +16,27 @@ endef
 .DELETE_ON_ERROR:
 
 PYTESTFLAGS+=
+# The command that runs pytest; override it to use another environment,
+# e.g. make all PYTEST="/path/to/venv/bin/python -m pytest".
+PYTEST?=	poetry run pytest
 
 TESTS=	$(shell ${find_tests})
 
 $(foreach files,${TESTS},$(eval $(call def_target, ${files})))
 
 .PHONY: all
+all: conftest.py
 all: $(foreach files,${TESTS},$(shell echo ${files} | cut -d: -f1))
-	poetry run pytest ${PYTESTFLAGS}
+	${PYTEST} ${PYTESTFLAGS}
+
+# The Testing chapter's conftest.py also holds the example fetchers that
+# the other chapters register, so it is tangled from all of them.
+conftest.py: $(wildcard ../src/fbf/*.nw)
+	notangle ${NOTANGLEFLAGS.py} "-R[[conftest.py]]" $^ > $@
 
 .PHONY: clean
 clean:
+	${RM} conftest.py
 	${RM} $(foreach files,${TESTS},$(shell echo ${files} | cut -d: -f1))
 	${RM} -Rf __pycache__
 

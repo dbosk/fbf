@@ -20,6 +20,9 @@ MODULES+=	cli.nw
 all: __init__.py ${MODULES:.nw=.tex}
 all: $(filter-out init.py,${MODULES:.nw=.py})
 
+# The Testing chapter tangles only tests/conftest.py (see tests/Makefile).
+all: testing.tex
+
 # Every chapter declares the FBF names it reads in <<required names>>.
 schema.py: canvas.nw discussions.nw
 
@@ -29,7 +32,7 @@ __init__.py: init.nw
 .PHONY: clean
 clean:
 	${RM} __init__.py $(filter-out init.py,${MODULES:.nw=.py})
-	${RM} ${MODULES:.nw=.tex}
+	${RM} ${MODULES:.nw=.tex} testing.tex
 
 .PHONY: distclean
 distclean:

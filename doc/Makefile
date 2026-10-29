@@ -10,6 +10,7 @@ fbf.pdf: ../src/fbf/schema.tex
 fbf.pdf: ../src/fbf/canvas.tex
 fbf.pdf: ../src/fbf/discussions.tex
 fbf.pdf: ../src/fbf/cli.tex
+fbf.pdf: ../src/fbf/testing.tex
 
 # The woven .tex files need their .nw as prerequisite for an edited source
 # to trigger a re-weave.

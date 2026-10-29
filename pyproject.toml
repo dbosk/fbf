@@ -29,6 +29,12 @@ canvaslms = ">=6.24"
 
 [tool.poetry.group.dev.dependencies]
 pytest = "^8.1.1"
+pytest-recording = "^0.14.0"
+
+[tool.pytest.ini_options]
+# Replay must never reach the network; a live run or a recording turns the
+# block off (see the Testing chapter, src/fbf/testing.nw).
+addopts = ["--block-network", "--allowed-hosts=127.0.0.1,::1,localhost"]
 
 [build-system]
 requires = ["poetry-core"]
