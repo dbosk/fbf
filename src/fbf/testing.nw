@@ -675,7 +675,14 @@ In a live run they share the launch's [[FBFLogin]]: when a test renews the
 tokens, FBF also replaces the refresh token, so the old one may no longer
 work, and the next test must see the new tokens.
 In replay each client gets a copy of the replayed login, so that a test that
-renews (and thereby replaces the placeholders) changes nothing for the next.
+changes it changes nothing for the next.
+The renewal test in \cref{API}, for one, sets an expired access token and
+lets the renewal replace it.
+Shared, the next test would start from whatever that left behind instead of
+from the replayed launch.
+No test fails because of it today, since replay does not match on the
+[[Authorization]] header; the copy keeps it that way when a test starts to
+depend on the token.
 <<test fixtures>>=
 @pytest.fixture
 def fbf(request, recording, launched):
