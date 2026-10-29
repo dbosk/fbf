@@ -112,6 +112,7 @@ from pathlib import Path
 import pytest
 import vcr as vcrpy
 
+import fbf.api as fbf_api
 from fbf.api import FBF
 from fbf.launch import launch, parse_page
 
@@ -699,6 +700,63 @@ def canvas_token(request, recording, launched):
     """The Canvas API token for a test that launches FBF itself."""
     live = require_service(request, recording, launched)
     return live.canvas_token if live else REPLAY_TOKEN
+@
+
+\subsection{One request at a time}
+
+[[FBF.get_many]] sends its requests from several threads at once
+(\cref{API}).
+[[vcrpy]] cannot follow that: when requests overlap, it records only a few
+of them and lets the others through unrecorded, and in replay it lets the
+unrecorded ones go for the network.
+The first real recording lost 153 of the 179 requests of one test that way,
+and its replay then failed on the network block.
+So a service test sends one request at a time: we set the number of
+workers to one for every test marked [[vcr]].
+[[get_many]] still runs its pool and returns the documents in order, so
+only the overlap is not tested here; the hand-written fake in \cref{API}
+tests that.
+<<test fixtures>>=
+@pytest.fixture(autouse=True)
+def one_request_at_a_time(request, monkeypatch):
+    """Let a service test send its requests one at a time, which is all
+    that `vcrpy` can record."""
+    if request.node.get_closest_marker("vcr") is not None:
+        monkeypatch.setattr(fbf_api, "WORKERS", 1)
+@
+
+Let's verify it with an inner run (\cref{InnerRuns}) that records many
+requests through [[get_many]] from the local service of \cref{Drift}: the
+cassette must hold every one of them.
+<<test functions>>=
+PARALLEL_TESTS = """
+import os
+
+import pytest
+
+from fbf.api import FBF
+from fbf.launch import FBFLogin
+
+@pytest.fixture(scope="session", autouse=True)
+def launched():
+  return "the inner run never launches"
+
+@pytest.mark.vcr
+def test_fetch_many():
+  client = FBF(FBFLogin("access", "refresh", os.environ["FBF_TEST_SERVICE"]))
+  client.get_many([(f"v1/items/{n}", {}) for n in range(40)])
+"""
+
+def test_a_recording_holds_every_parallel_request(
+    pytester, local_service, monkeypatch):
+  make_inner_conftest(pytester, monkeypatch)
+  pytester.makepyfile(test_inner=PARALLEL_TESTS)
+  result = pytester.runpytest_inprocess(
+    "--record-mode=once", "-p", "no:cacheprovider")
+  result.assert_outcomes(passed=1)
+  cassette = pytester.path / "cassettes" / "test_inner" / "test_fetch_many.yaml"
+  interactions = conftest.vcr_support.load_cassette(cassette)
+  assert len(interactions) == 40
 @
 
 Finally, in replay we check that the test made every request its cassette
@@ -1757,7 +1815,7 @@ def local_service(monkeypatch):
   class Handler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
       body = {"/token": {"reference": FAKE_JWT},
-              "/data": {"renamed": 1}}[self.path]
+              "/data": {"renamed": 1}}.get(self.path, {"data": []})
       payload = json.dumps(body).encode("utf-8")
       self.send_response(200)
       self.send_header("Content-Type", "application/json")
