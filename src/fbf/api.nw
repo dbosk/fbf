@@ -539,6 +539,7 @@ def test_get_by_ids_batches_and_keeps_only_asked():
   ids = [f"u{n}" for n in range(120)] + [None, "u1"]
   users = fbf.get_by_ids("v1/users", ids)
   assert sorted(users) == sorted(f"u{n}" for n in range(120))
+@
 
 
 \subsection{Against FBF}

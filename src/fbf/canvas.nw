@@ -218,11 +218,11 @@ def placement_of_the_launched_activity(fbf, launched):
                        included=document.included)
 @
 
-The same placement lets us test [[activity_id]] against FBF.
-Looking up the placement's code must lead back to the activity the placement
-came from, which is the activity we launched.
-That holds on any day, live or replayed, and it fails if the filter or our
-check of the code goes wrong.
+The same placement lets us test [[activities_by_code]] against FBF.
+The code of the launched activity's placement must lead back to that
+activity among the activities of the launched course.
+That holds on any day, live or replayed, and it fails if we read the
+placements wrongly or look in the wrong course.
 <<test functions>>=
 import pytest
 
@@ -230,8 +230,9 @@ import conftest
 from fbf.schema import attribute
 
 @pytest.mark.vcr
-def test_activity_id_finds_the_launched_activity(fbf):
+def test_activities_by_code_finds_the_launched_activity(fbf):
   placement = conftest.EXAMPLES["lti/placement"](fbf, fbf.login)
   code = attribute(placement, "code")
-  assert activity_id(fbf, code) == fbf.login.activity_uuid
+  codes = activities_by_code(fbf, fbf.login.course_uuid)
+  assert codes[code] == fbf.login.activity_uuid
 @

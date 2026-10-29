@@ -576,3 +576,112 @@ def add_command(subp):
                         help="print threads with their replies as JSON")
     parser.set_defaults(func=discussions_command)
 @
+
+
+\section{Examples for the contract test}
+
+The contract test of \cref{Schema} checks the names declared above against
+FBF, and it needs an example resource of each type.
+They all hang off materials, so the fetchers search the materials of the
+launched activity first and then those of the other activities in its
+course, until they find the type.
+The launched activity is a video with teacher questions, so most types are
+found at once; comments, document fragments and choice questions may take a
+few activities more.
+A type that cannot be found raises with its name, rather than failing on an
+empty value.
+These chunks are tangled into [[conftest.py]] together with the fetchers of
+the other chapters, hence the imports here and the names prefixed with the
+chapter's subject.
+
+<<example fetchers>>=
+from fbf import discussions as discussion
+
+
+def discussion_materials(fbf, launched):
+    """Yield `(document, material)` from the launched activity, then course."""
+    others = [activity["id"] for activity in
+              fbf.get(f"v1/courses/{launched.course_uuid}/activities")
+              .resources if activity["id"] != launched.activity_uuid]
+    for activity in [launched.activity_uuid] + others:
+        document = fbf.get(f"v1/activities/{activity}",
+                           include="tasks.material")
+        for (kind, _), material in document.included.items():
+            if kind == "multimedia/material":
+                yield document, material
+
+
+def discussion_example(fbf, launched, kind, resources_of):
+    """Return the first resource of `kind` among `resources_of` a material."""
+    for document, material in discussion_materials(fbf, launched):
+        for resource in resources_of(fbf, document, material):
+            if resource["type"] == kind:
+                return resource
+    raise LookupError(f"no {kind} in the launched course")
+
+
+def discussion_list(name):
+    """Return a function listing a material's relationship `name`."""
+    return lambda fbf, document, material: fbf.get(
+        discussion.related_link(material, name)).resources
+
+
+def discussion_answers(fbf, document, material):
+    """List the answers to the questions on a material."""
+    for question in discussion_list("questions")(fbf, document, material):
+        yield from fbf.get(discussion.related_link(question,
+                                                   "answers")).resources
+
+
+def discussion_choices(fbf, document, material):
+    """List the choices of the choice questions on a material."""
+    questions = discussion_list("questions")(fbf, document, material)
+    return discussion.fetch_choices(fbf, questions).values()
+
+
+@example("activities")
+def launched_activity(fbf, launched):
+    return fbf.get(f"v1/activities/{launched.activity_uuid}").resource
+
+
+@example("users")
+def current_user(fbf, launched):
+    return fbf.get("v1/users/current").resource
+
+
+@example("multimedia-tasks")
+def multimedia_task(fbf, launched):
+    return discussion_example(
+        fbf, launched, "multimedia-tasks",
+        lambda fbf, document, material: document.included.values())
+
+
+@example("multimedia/material")
+def material(fbf, launched):
+    return discussion_example(
+        fbf, launched, "multimedia/material",
+        lambda fbf, document, material: [material])
+
+
+for kind, relationship in [("comments", "comments"),
+                           ("annotations", "annotations"),
+                           ("video-fragments", "fragments"),
+                           ("document-fragments", "fragments"),
+                           ("open-questions", "questions"),
+                           ("multiple-choice-questions", "questions"),
+                           ("scratch-off-questions", "questions")]:
+    example(kind)(lambda fbf, launched, kind=kind, name=relationship:
+                  discussion_example(fbf, launched, kind,
+                                     discussion_list(name)))
+
+for kind in ["open-answers", "multiple-choice-answers",
+             "scratch-off-answers"]:
+    example(kind)(lambda fbf, launched, kind=kind:
+                  discussion_example(fbf, launched, kind,
+                                     discussion_answers))
+
+example("questions/choice")(
+    lambda fbf, launched: discussion_example(fbf, launched,
+                                             "questions/choice",
+                                             discussion_choices))
+@
