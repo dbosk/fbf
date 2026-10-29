@@ -954,6 +954,11 @@ if set_aside:
 The command follows [[discussions]] (\cref{Discussions}): it takes the
 [[canvaslms]] assignment options, skips assignments that are not FBF's, and
 notes those not opened in FBF this round.
+It is split in three, so that the part that decides can be tested without
+a launch: the command proper selects the assignments and launches
+([[fbf_activities]] of \cref{Canvas}), [[collect_progress]] fetches and
+assembles the rows of the activities it gets, and [[show_progress]]
+filters and prints them.
 
 <<imports>>=
 import json
@@ -972,16 +977,34 @@ def progress_command(config, canvas, args):
     if not assignments:
         raise canvaslms.cli.EmptyListError("No FeedbackFruits assignments")
     hostname, token = canvaslms.cli.login.load_credentials(config)
+    show_progress(collect_progress(canvas, fbfcanvas.fbf_activities(
+        canvaslms.cli.cache.normalize_hostname(hostname), token,
+        assignments)), args)
+@
+
+[[collect_progress]] keeps the caches of [[assignment_progress]] for the
+whole run, which is what makes the second assignment of a course cheap.
+
+<<functions>>=
+def collect_progress(canvas, activities):
+    """Return the `Progress` rows of the FBF `activities`.
+
+    `activities` yields `(assignment, fbf, activity_id)`, as
+    `fbf.canvas.fbf_activities` does.
+    """
     emails, students, rows = {}, {}, []
-    for assignment, fbf, activity in fbfcanvas.fbf_activities(
-            canvaslms.cli.cache.normalize_hostname(hostname), token,
-            assignments):
+    for assignment, fbf, activity in activities:
         if activity:
             rows += assignment_progress(fbf, canvas, assignment, activity,
                                         emails, students)
         else:
             print(f"{assignment.name}: not opened in FeedbackFruits "
                   "this course round, skipped", file=sys.stderr)
+    return rows
+
+
+def show_progress(rows, args):
+    """Print the `rows` that `args` select, in the format they ask for."""
     rows = [row for row in rows
             if (not args.unpublished or unpublished(row))
             and (not args.mismatch or mismatch(row))]
@@ -1021,6 +1044,206 @@ def add_command(subp):
     parser.add_argument("--json", action="store_true",
                         help="print the rows with their facets as JSON")
     parser.set_defaults(func=progress_command)
+@
+
+\subsection{Testing the command without a launch}
+
+The fetching and the command are where the requests are made, the caches
+kept and the warnings written, and the tests above do not reach them.
+The rung of the testing ladder they call for is a recording
+(\cref{Testing}), and there is one below, but a recording of a real course
+cannot be committed, so it says nothing where it is missing.
+We therefore also drive [[collect_progress]] and [[show_progress]] with
+stand-ins (rung~4): an [[FBF]] client whose [[get]], the one method that
+reaches the network, answers from resources shaped like FBF's, and a
+Canvas that hands out real [[canvasapi]] objects.
+Everything above [[get]]---[[get_many]], [[get_by_ids]], our fetching and
+assembling---runs for real.
+The stand-in serves the tasks only when asked to include them, and grades
+only by the ids asked for, as FBF does.
+
+<<test functions>>=
+from argparse import Namespace
+import json as jsonlib
+
+from canvasapi.assignment import Assignment as CanvasAssignment
+from canvasapi.submission import Submission
+from canvasapi.user import User
+from fbf.api import FBF
+
+class FakeFBF(FBF):
+  def __init__(self, progresses, emails, grades):
+    super().__init__(login=None)
+    self.progresses, self.emails, self.grades = progresses, emails, grades
+    self.requests = []
+  def get(self, path, **params):
+    self.requests.append(path)
+    if path == "v1/activities/act":
+      tasks = [VIDEO, REFLECT]
+      return Document({
+        "data": {"type": "activities", "id": "act", "relationships": {
+          "tasks": {"data": [{"type": t["type"], "id": t["id"]}
+                             for t in tasks]}}},
+        "included": tasks if params.get("include") == "tasks" else []})
+    if path == "v1/progresses":
+      return Document({"data": self.progresses})
+    if path.startswith("v1/people/"):
+      actor = path.split("/")[2]
+      return Document({"data": [
+        {"type": "emails", "id": f"e{n}", "attributes": {"address": a}}
+        for n, a in enumerate(self.emails[actor])]})
+    if path == "v1/lti/grades":
+      ids = params["filter[id]"].split(",")
+      return Document({"data": [g for g in self.grades if g["id"] in ids]})
+    raise AssertionError(f"unexpected request {path}")
+
+class FakeCourse:
+  def __init__(self, users):
+    self.users, self.calls = users, []
+  def get_users(self, **params):
+    self.calls.append(params)
+    return self.users
+
+class FakeCanvas:
+  def __init__(self, course):
+    self.course = course
+  def get_course(self, course_id):
+    return self.course
+
+class FakeAssignment(CanvasAssignment):
+  def get_submissions(self, **params):
+    return [Submission(None, s) for s in self.submissions]
+@
+
+The course has three students and a teaching assistant.
+Ada has a published grade, which Canvas has as 5 points instead of 6, and
+a second, empty, FBF identity; Bo has an unpublished grade whose breakdown
+does not add up; Cy never opened the activity; Di opened it and did
+nothing.
+Two assignments use the activity, and a third was not opened.
+
+<<test functions>>=
+def canvas_user(id, login, *types):
+  return User(None, {"id": id, "login_id": login, "email": login,
+                     "enrollments": [{"type": t} for t in types]})
+
+def command_world():
+  fbf = FakeFBF(
+    [progress("a1", published="2026-10-01", grade="g1"),
+     progress("a1b", overall=0.0, grades={}, kind="people"),
+     progress("a2", overall=50.0, grades={"t1": {"viewed": 40}}),
+     progress("a4", overall=0.0, grades={}),
+     progress("ta")],
+    {"a1": ["ada@example.com"], "a1b": ["ada@example.com"],
+     "a2": ["bo@example.com"], "a4": ["di@example.com"],
+     "ta": ["ta@example.com"]},
+    list(SENT.values()))
+  course = FakeCourse([canvas_user(1, "ada@example.com", "StudentEnrollment"),
+                       canvas_user(2, "bo@example.com", "StudentEnrollment"),
+                       canvas_user(3, "cy@example.com", "StudentEnrollment"),
+                       canvas_user(4, "di@example.com", "StudentEnrollment"),
+                       canvas_user(9, "ta@example.com", "TaEnrollment")])
+  submissions = [{"user_id": 1, "score": 5.0, "grade": "5"},
+                 {"user_id": 2, "score": None, "grade": None},
+                 {"user_id": 3, "score": None, "grade": None}]
+  assignments = [FakeAssignment(None, {"id": n, "name": f"Week {n}",
+                                       "points_possible": 10,
+                                       "course_id": 5,
+                                       "submissions": submissions})
+                 for n in (1, 2, 3)]
+  activities = [(assignments[0], fbf, "act"), (assignments[1], fbf, "act"),
+                (assignments[2], fbf, None)]
+  return fbf, course, collect_progress(FakeCanvas(course), activities)
+@
+
+Collecting fetches each address and the list of students once, though
+two assignments need them, and asks Canvas for the enrollments that tell
+students from assistants.
+The warnings give the counts, once per assignment, and no address.
+
+<<test functions>>=
+def test_collect_progress_fetches_once_and_warns_with_counts(capsys):
+  fbf, course, rows = command_world()
+  assert [(r.assignment, r.student) for r in rows] == [
+    (f"Week {n}", f"{s}@example.com") for n in (1, 2) for s in
+    ("ada", "bo", "cy", "di")]
+  ada = rows[0]
+  assert (ada.fbf_actor_id, ada.sent_grade, ada.canvas_score,
+          len(ada.facets)) == ("a1", 0.6, 5.0, 4)
+  assert sum(path.startswith("v1/people/") for path in fbf.requests) == 5
+  assert len(course.calls) == 1
+  assert set(course.calls[0]["include"]) == {"email", "enrollments"}
+  err = capsys.readouterr().err
+  assert err.count("1 FBF participants are not students") == 2
+  assert err.count("1 progresses set aside") == 2
+  assert err.count("1 of 3 breakdowns do not add up") == 2
+  assert err.count("Week 3: not opened") == 1
+  assert "@" not in err
+@
+
+[[show_progress]] then selects and formats: Bo for [[--unpublished]], Ada
+for [[--mismatch]], nobody for both, a row per facet with [[--long]], and
+everything with [[--json]].
+
+<<test functions>>=
+def show(rows, capsys, **options):
+  args = Namespace(**{"unpublished": False, "mismatch": False,
+                      "long": False, "json": False, **options})
+  capsys.readouterr()
+  show_progress(rows, args)
+  return capsys.readouterr().out
+
+def test_show_progress_selects_and_formats(capsys):
+  _, _, rows = command_world()
+  lines = show(rows, capsys).splitlines()
+  assert len(lines) == 8
+  assert lines[0].split("\t")[:7] \
+    == ["Week 1", "ada@example.com", "50", "60", "6", "yes", "5"]
+  students = lambda out: [line.split("\t")[:2] for line in out.splitlines()]
+  assert students(show(rows, capsys, unpublished=True)) \
+    == [["Week 1", "bo@example.com"], ["Week 2", "bo@example.com"]]
+  assert students(show(rows, capsys, mismatch=True)) \
+    == [["Week 1", "ada@example.com"], ["Week 2", "ada@example.com"]]
+  assert show(rows, capsys, unpublished=True, mismatch=True) == ""
+  long = show(rows, capsys, long=True).splitlines()
+  assert len(long) == 24 and all(len(l.split("\t")) == 9 for l in long)
+  data = jsonlib.loads(show(rows, capsys, json=True))
+  assert [len(row["facets"]) for row in data] == [4, 4, 0, 4] * 2
+@
+
+The stand-ins answer as we believe FBF and Canvas do.
+Whether they still do, only the services can say, so the same path also
+runs on the launched assignment of the test course, recorded and replayed
+like the other service tests (\cref{Testing}).
+It asserts what holds on any day rather than values: a row for every
+student of the course and only for them, maxima that sum to 100,
+breakdowns that add up to the grade, and a grade sent wherever the
+progress points to one.
+
+<<test functions>>=
+import canvasapi
+import conftest
+
+@pytest.mark.vcr
+def test_assignment_progress_on_the_launched_activity(fbf, canvas_token):
+  canvas = canvasapi.Canvas(conftest.CANVAS_URL, canvas_token)
+  assignment = canvas.get_course(conftest.COURSE_ID).get_assignment(
+    conftest.ASSIGNMENT_ID)
+  activity = fbf.login.activity_uuid
+  students = {}
+  rows = assignment_progress(fbf, canvas, assignment, activity, {},
+                             students)
+  ids = [row.canvas_user_id for row in rows]
+  assert rows and len(ids) == len(set(ids))
+  assert set(ids) == {s.id for s in students[assignment.course_id]}
+  graded = [row for row in rows if row.overall is not None]
+  assert all(abs(sum(f.weight for f in row.facets) - 100) <= 0.01
+             for row in graded)
+  assert all(adds_up(row.facets, row.overall) for row in graded)
+  latest = {related_id(p, "actor"): related_id(p, "latest-grade")
+            for p in activity_progresses(fbf, activity)}
+  assert all(row.sent_grade is not None for row in graded
+             if latest.get(row.fbf_actor_id))
 @
 
 
