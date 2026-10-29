@@ -1374,19 +1374,19 @@ chapters, hence the import and the prefixed names.
 from fbf import reviews as review
 
 
-def review_task_sets(fbf, launched):
+def review_task_sets(fbf, login):
     """Yield the tasks of the peer reviews in the launched course."""
     for activity in fbf.get(
-            f"v1/courses/{launched.course_uuid}/activities").resources:
+            f"v1/courses/{login.course_uuid}/activities").resources:
         if (activity.get("attributes") or {}).get("tool") == "peerfeedback":
             tasks = review.peer_review_tasks(fbf, activity["id"])
             if tasks:
                 yield tasks
 
 
-def review_example(fbf, launched, kind, resources_of):
+def review_example(fbf, login, kind, resources_of):
     """Return the first resource of `kind` among `resources_of` some tasks."""
-    for tasks in review_task_sets(fbf, launched):
+    for tasks in review_task_sets(fbf, login):
         for resource in resources_of(fbf, tasks):
             if resource["type"] == kind:
                 return resource
@@ -1425,41 +1425,41 @@ def review_options(fbf, tasks):
 
 
 for kind in [review.REVIEW_TASK, review.VIEW_TASK, review.REFLECT_TASK]:
-    example(kind)(lambda fbf, launched, kind=kind:
-                  review_example(fbf, launched, kind,
+    example(kind)(lambda fbf, login, kind=kind:
+                  review_example(fbf, login, kind,
                                  lambda fbf, tasks: tasks.values()))
 
 example("assignments/allocation")(
-    lambda fbf, launched: review_example(fbf, launched,
+    lambda fbf, login: review_example(fbf, login,
                                          "assignments/allocation",
                                          review_list("allocations")))
 
 for kind in review.CRITERION_TYPES:
-    example(kind)(lambda fbf, launched, kind=kind:
-                  review_example(fbf, launched, kind,
+    example(kind)(lambda fbf, login, kind=kind:
+                  review_example(fbf, login, kind,
                                  review_list("criteria")))
 
 example("assignments/criterion-option")(
-    lambda fbf, launched: review_example(fbf, launched,
+    lambda fbf, login: review_example(fbf, login,
                                          "assignments/criterion-option",
                                          review_options))
 
 for kind, name, has_any in [
         ("reviews", "reviews", review.counted("reviews-count")),
         ("ratings", "ratings", review.counted("ratings-count"))]:
-    example(kind)(lambda fbf, launched, kind=kind, name=name,
+    example(kind)(lambda fbf, login, kind=kind, name=name,
                   has_any=has_any:
-                  review_example(fbf, launched, kind,
+                  review_example(fbf, login, kind,
                                  review_allocation_list(name, has_any)))
 
 example("reviewer-feedbacks")(
-    lambda fbf, launched: review_example(
-        fbf, launched, "reviewer-feedbacks",
+    lambda fbf, login: review_example(
+        fbf, login, "reviewer-feedbacks",
         review_allocation_list("reviewer-feedback", review.reviewed,
                                review.feedback_enabled)))
 
 example("reflections")(
-    lambda fbf, launched: review_example(
-        fbf, launched, "reflections",
+    lambda fbf, login: review_example(
+        fbf, login, "reflections",
         review_list("reflections", review.REFLECT_TASK)))
 @
