@@ -378,16 +378,33 @@ POST, which today is the API host itself.
 The API's location is not worth failing the launch over, since we can still
 find it.
 
+The tokens are left out of the [[repr]] of an [[FBFLogin]].
+A data class shows every field by default, and its [[repr]] turns up where
+nobody asked for the tokens: in a failed [[assert]], which [[pytest]]
+explains by printing the values involved, in a traceback, in a log line.
+Whoever holds the access token is the user for 30~minutes, and with the
+refresh token for 14~days.
+
 <<classes>>=
 @dataclasses.dataclass
 class FBFLogin:
     """The result of a launch: FBF tokens and where to use them."""
 
-    access_token: str
-    refresh_token: str
+    access_token: str = dataclasses.field(repr=False)
+    refresh_token: str = dataclasses.field(repr=False)
     api_url: str
     course_uuid: str = None
     activity_uuid: str = None
+@
+
+<<test functions>>=
+def test_login_repr_hides_the_tokens():
+  login = FBFLogin("eyJaccess", "r3fresh", "https://api.example.com")
+  shown = repr(login)
+  hides_tokens = "eyJaccess" not in shown and "r3fresh" not in shown
+  assert hides_tokens
+  assert "https://api.example.com" in shown
+
 <<functions>>=
 def complete_launch(session, id_token_form):
     """Submit the `id_token` form and return the resulting `FBFLogin`."""
