@@ -1019,15 +1019,34 @@ that a client needs, and [[vcr_support]] then replaces the values of the
 cookies and scrubs the [[Location]].
 The others would only tell a reader about the session (Canvas sends request
 and session identifiers), and none of our code reads them.
+
+The cookies also lose their lifetime.
+FBF's [[access_token]] cookie expires after 30~minutes, and [[requests]]
+honours that in replay as a browser would: half an hour after the recording,
+the replayed cookie has expired before it arrives, [[requests]] drops it,
+and hop~3 of the replayed launch fails for want of an [[access_token]].
+A replay runs at any time after the recording, so a lifetime measured from
+the recording means nothing there.
+We therefore remove [[Expires]] and [[Max-Age]], which makes every replayed
+cookie a session cookie.
+The price is that a cookie that the service deletes, by giving it a
+lifetime in the past, stays set in replay; our code looks up cookies only by
+name, after the launch has set them, so that does not matter to it.
+[[vcrpy]] also runs this hook on the responses it loads from a cassette, so
+cassettes recorded before this rule are fixed as they are read.
 <<scrubbing for FBF>>=
 KEPT_RESPONSE_HEADERS = {"content-type", "content-length", "location",
                          "set-cookie"}
+COOKIE_LIFETIME = re.compile(r"(?i);\s*(?:expires|max-age)=[^;]*")
 <<[[FBFPseudonymizer]] methods>>=
 def before_record_response(self, response):
     headers = response.get("headers", {})
     for name in list(headers):
         if name.lower() not in KEPT_RESPONSE_HEADERS:
             del headers[name]
+        elif name.lower() == "set-cookie":
+            headers[name] = [COOKIE_LIFETIME.sub("", value)
+                             for value in headers[name]]
     content_type = " ".join(
         value for name, values in headers.items()
         if name.lower() == "content-type" for value in values)
@@ -1093,6 +1112,33 @@ def test_recordings_redact_redirects_and_cookies(scrubber):
     "https://canvas.example.com/api/lti/authorize"
     "?state=redacted&client_id=1000"]
   assert headers["Set-Cookie"] == ["access_token=redacted; path=/; secure"]
+@
+
+A recorded cookie must survive in replay however long after the recording
+the replay runs.
+We record two cookies that, seen from now, have long expired, in both ways a
+service can say so, and check that a [[requests]] cookie jar given the
+recorded headers keeps both.
+<<test functions>>=
+def test_replayed_cookies_do_not_expire(scrubber):
+  import http.client
+  import requests
+  response = scrubber.before_record_response(recorded_response(
+    "", **{"Set-Cookie": [
+      "access_token=eyJabc; Expires=Thu, 01 Jan 2004 00:00:00 GMT; path=/",
+      "refresh_token=def; Max-Age=-1; Path=/; secure"]}))
+  cookies = response["headers"]["Set-Cookie"]
+  assert cookies == ["access_token=redacted; path=/",
+                     "refresh_token=redacted; Path=/; secure"]
+  message = http.client.HTTPMessage()
+  for cookie in cookies:
+    message["Set-Cookie"] = cookie
+  jar = requests.cookies.RequestsCookieJar()
+  jar.extract_cookies(
+    requests.cookies.MockResponse(message),
+    requests.cookies.MockRequest(
+      requests.Request("GET", "https://api.example.com/").prepare()))
+  assert {cookie.name for cookie in jar} == {"access_token", "refresh_token"}
 @
 
 When the launch submits a form, the recorded body and the replayed one must
