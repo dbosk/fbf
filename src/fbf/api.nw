@@ -215,6 +215,7 @@ class FBF:
         self.login = login
         self.relaunch = relaunch
         self.session = session or requests.Session()
+        self.renewal = threading.Lock()
 
     <<FBF methods>>
 @
@@ -231,7 +232,8 @@ class APIError(Exception):
     def __init__(self, status, method, url):
         self.status = status
         path = urllib.parse.urlsplit(url).path
-        super().__init__(f"{method} {path}: HTTP {status}")
+        reason = "timed out" if status == "timeout" else f"HTTP {status}"
+        super().__init__(f"{method} {path}: {reason}")
 @
 
 \subsection{Requests and renewal}
@@ -242,25 +244,48 @@ On a [[401]] it renews the tokens once and repeats the request; a second
 would loop.
 That way callers never see the 30-minute expiry.
 
+Requests may run in parallel (\cref{Parallel}), and then several of them
+can meet the expired token at once.
+Each would renew, but a refresh rotates the refresh token, so the second
+refresh would present a token that is no longer valid.
+So renewal holds a lock, and a request renews only if the token it was
+refused with is still the current one; otherwise another request has
+renewed already and it simply retries with the new token.
+
+Every request also has a timeout.
+Some FBF endpoints never answer---an exploration found one that hangs until
+the connection is reset---and without a timeout the program would hang with
+them.
+The read timeout is generous, since a large list can take a while.
+
+<<imports>>=
+import threading
 <<constants>>=
 JSONAPI_ACCEPT = "application/vnd.api+json"
+TIMEOUT = (10, 120)
 <<FBF methods>>=
 def request(self, method, path, **kwargs):
     """Send a request to `path` and return the `requests` response."""
     url = api_url_for(self.login.api_url, path)
-    response = self._send(method, url, **kwargs)
+    token = self.login.access_token
+    response = self._send(method, url, token, **kwargs)
     if response.status_code == 401:
-        self.renew()
-        response = self._send(method, url, **kwargs)
+        with self.renewal:
+            if self.login.access_token == token:
+                self.renew()
+        response = self._send(method, url, self.login.access_token, **kwargs)
     if not response.ok:
         raise APIError(response.status_code, method, url)
     return response
 
-def _send(self, method, url, **kwargs):
-    headers = {"Authorization": f"Bearer {self.login.access_token}",
-               "Accept": JSONAPI_ACCEPT}
+def _send(self, method, url, token, **kwargs):
+    headers = {"Authorization": f"Bearer {token}", "Accept": JSONAPI_ACCEPT}
     headers.update(kwargs.pop("headers", {}))
-    return self.session.request(method, url, headers=headers, **kwargs)
+    kwargs.setdefault("timeout", TIMEOUT)
+    try:
+        return self.session.request(method, url, headers=headers, **kwargs)
+    except requests.exceptions.Timeout:
+        raise APIError("timeout", method, url)
 @
 
 Renewal first tries the refresh token, which costs one request, and falls
@@ -383,4 +408,85 @@ def test_related_refuses_unresolvable_references():
   import pytest
   with pytest.raises(LookupError, match="include='tasks'"):
     FBF(login=None).related(ACTIVITY, "tasks")
+@
+
+
+\section{Fetching in parallel}
+\label{Parallel}
+
+Some data can only be had one small request at a time: a peer-review
+activity keeps its reviews per reviewer--reviewee pair, which makes some
+800~requests for one activity.
+At about 0.17~seconds each that is over two minutes, nearly all of it spent
+waiting for FBF.
+[[get_many]] sends such requests from a few threads at once.
+We keep the number of threads small: FBF is a shared service, and a handful
+of parallel requests is what its own web app makes when it loads a page.
+The results come back in the order of the requests, so callers can zip them
+with what they asked for.
+
+<<constants>>=
+WORKERS = 6
+<<imports>>=
+import concurrent.futures
+<<FBF methods>>=
+def get_many(self, requests):
+    """Return the `Document`s for `requests`, fetched in parallel.
+
+    `requests` is a list of `(path, params)` pairs; the documents come back
+    in the same order.
+    """
+    with concurrent.futures.ThreadPoolExecutor(WORKERS) as pool:
+        return list(pool.map(lambda request: self.get(request[0],
+                                                      **request[1]),
+                             requests))
+@
+
+Let's verify the order and the renewal logic without a network: a session
+that answers [[401]] to the expired token stands in for FBF.
+To make the requests really meet the expired token together, the fake
+holds each refused request at a barrier until all the workers have arrived;
+without that, the threads would take turns and the test would prove
+nothing.
+Likewise the refresh takes a moment, as a real one does, so that the other
+threads would check the token while it is under way if the lock did not
+make them wait.
+It is a hand-written fake (rung~4 of the testing ladder), because what we
+need---many threads meeting an expired token at once---cannot be recorded.
+The refresh must happen once, however many requests failed.
+
+<<test functions>>=
+import threading as _threading
+import time
+from types import SimpleNamespace
+
+class ExpiringSession:
+  def __init__(self):
+    self.lock = _threading.Lock()
+    self.refreshes = 0
+    self.together = _threading.Barrier(WORKERS, timeout=10)
+  def request(self, method, url, headers=None, **kwargs):
+    token = headers["Authorization"].split()[-1]
+    if token == "old":
+      self.together.wait()
+      return SimpleNamespace(status_code=401, ok=False)
+    path = url.split("example.com/")[-1]
+    return SimpleNamespace(status_code=200, ok=True,
+                           json=lambda: {"data": {"type": "x", "id": path}})
+  def post(self, url, data=None, **kwargs):
+    with self.lock:
+      self.refreshes += 1
+    time.sleep(0.2)
+    return SimpleNamespace(ok=True, json=lambda: {
+      "access_token": f"new{self.refreshes}", "refresh_token": "r2"})
+
+def test_get_many_keeps_order_and_refreshes_once():
+  session = ExpiringSession()
+  login = SimpleNamespace(access_token="old", refresh_token="r1",
+                          api_url="https://api.example.com")
+  fbf = FBF(login, session=session)
+  paths = [f"v1/x/{n}" for n in range(20)]
+  documents = fbf.get_many([(path, {}) for path in paths])
+  assert [d.resource["id"] for d in documents] == paths
+  assert session.refreshes == 1
 @
