@@ -325,7 +325,11 @@ replies are fetched only when its [[comments-count]] says there are any.
 <<functions>>=
 def fetch_posts(fbf, link, reply=False, choices=None):
     """Return the `Post`s at the relationship `link`, replies included."""
-    document = fbf.get(link, include="user")
+    return posts_in(fbf, fbf.get(link, include="user"), reply, choices)
+
+
+def posts_in(fbf, document, reply=False, choices=None):
+    """Return the `Post`s of the posts in `document`, replies included."""
     users = users_of(fbf, document)
     return [make_post(resource, users, fetch_replies(fbf, resource),
                       reply=reply, choices=choices)
@@ -342,14 +346,18 @@ def fetch_replies(fbf, resource):
 A question's answers are posts below it, like replies, but the question's
 replies proper (its [[comments]]) come too.
 We put the answers first, since they are what the question asked for.
+The caller fetches the answers, since it fetches those of all questions at
+once.
 
 <<functions>>=
-def fetch_question(fbf, resource, users, choices=None):
-    """Return the `Post` of a question with its answers and replies."""
-    answers = fetch_posts(fbf, related_link(resource, "answers"),
-                          choices=choices)
+def question_post(fbf, resource, users, answers, choices=None):
+    """Return the `Post` of a question with its `answers` and replies.
+
+    `answers` is the `Document` of the question's answers.
+    """
     return make_post(resource, users,
-                     answers + fetch_replies(fbf, resource))
+                     posts_in(fbf, answers, choices=choices)
+                     + fetch_replies(fbf, resource))
 
 
 def related_link(resource, name):
@@ -362,26 +370,37 @@ from fbf.schema import relationship
 A material's threads are its comments and its questions, each placed by the
 annotations.
 Opening comments become posts with their replies; questions go through
-[[fetch_question]], which adds the answers.
+[[question_post]], which adds the answers.
+
+Most of the time goes into waiting for FBF: a video with a dozen questions
+means a dozen requests for answers, and a course has hundreds.
+So we fetch the material's four lists in parallel, and then the answers of
+all its questions in parallel ([[get_many]] of \cref{Parallel}).
+The authors of a list are looked up once for the list, not once per post,
+since a lookup may cost a request.
 
 <<functions>>=
 def material_threads(fbf, material, activity):
     """Return the `Thread`s on a `material`, sorted by position."""
-    lists = {name: fbf.get(related_link(material, name)).resources
-             for name in ("annotations", "fragments")}
-    places = anchors(lists["annotations"], lists["fragments"])
-    comments = fbf.get(related_link(material, "comments"), include="user")
-    questions = fbf.get(related_link(material, "questions"), include="user")
+    annotations, fragments, comments, questions = fbf.get_many(
+        [(related_link(material, "annotations"), {}),
+         (related_link(material, "fragments"), {}),
+         (related_link(material, "comments"), {"include": "user"}),
+         (related_link(material, "questions"), {"include": "user"})])
+    places = anchors(annotations.resources, fragments.resources)
     choices = fetch_choices(fbf, questions.resources)
+    answers = fbf.get_many([(related_link(question, "answers"),
+                             {"include": "user"})
+                            for question in questions.resources])
+    commenters, askers = users_of(fbf, comments), users_of(fbf, questions)
     threads = [Thread(activity, position(places.get(resource["id"])),
-                      make_post(resource, users_of(fbf, comments),
+                      make_post(resource, commenters,
                                 fetch_replies(fbf, resource)))
                for resource in comments.resources]
     threads += [Thread(activity, position(places.get(resource["id"])),
-                       fetch_question(fbf, resource,
-                                      users_of(fbf, questions),
-                                      choices))
-                for resource in questions.resources]
+                       question_post(fbf, resource, askers, document,
+                                     choices))
+                for resource, document in zip(questions.resources, answers)]
     return sorted(threads, key=thread_order)
 
 
