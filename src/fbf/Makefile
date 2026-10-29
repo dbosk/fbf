@@ -13,13 +13,15 @@ MODULES+=	api.nw
 MODULES+=	har.nw
 MODULES+=	schema.nw
 MODULES+=	canvas.nw
+MODULES+=	discussions.nw
+MODULES+=	cli.nw
 
 .PHONY: all
 all: __init__.py ${MODULES:.nw=.tex}
 all: $(filter-out init.py,${MODULES:.nw=.py})
 
 # Every chapter declares the FBF names it reads in <<required names>>.
-schema.py: canvas.nw
+schema.py: canvas.nw discussions.nw
 
 __init__.py: init.nw
 	notangle -R"[[__init__.py]]" $< | cpif $@

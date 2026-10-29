@@ -1,0 +1,592 @@
+\chapter{Discussions in videos and documents}
+\label{Discussions}
+
+In FBF's video and document activities students discuss the material in
+place: they mark a passage of the video or a region of the document and
+comment on it, and others reply.
+In videos the teacher can also pose questions at given times, which the
+students answer.
+None of this reaches Canvas, which gets a completion grade at most.
+The [[discussions]] command lists these threads.
+
+\section{How FBF stores a discussion}
+
+We learned the structure by following the API's relationships from an
+activity; \cref{discussion-model} shows what we found.
+\begin{description}
+\item[Activity and material.] A video or document activity has several
+  tasks.
+  One of them, a [[multimedia-tasks]] resource, has the [[material]]: a
+  [[multimedia/material]], the same type for videos and documents.
+\item[Threads.] The material has [[comments]], the opening posts of the
+  students' threads, and [[questions]], the teacher's.
+  Questions come in three types: [[open-questions]],
+  [[multiple-choice-questions]] and [[scratch-off-questions]].
+  A question has [[answers]], each with a [[score]].
+  An open answer has a [[body]]; a choice answer has none, nor upvotes, but
+  [[choices]], references to the question's choices
+  ([[questions/choice]], each with a [[body]]).
+  The choices come only as bare references; we fetch them in one request
+  per material, as [[v1/questions/choices?filter[id]=...]].
+\item[Replies.] Comments, questions and answers all have [[comments]] of
+  their own, which are replies and may have replies in turn.
+  The attribute [[comments-count]] tells whether there are any, which saves
+  a request per post without replies.
+\item[Position.] The material's [[annotations]] tie a thread to a place: an
+  annotation's [[child]] is the comment or question, its [[parent]] a
+  fragment.
+  A [[video-fragments]] resource spans [[time-min]] to [[time-max]] seconds,
+  a [[document-fragments]] resource a rectangle from [[x-min]], [[y-min]] to
+  [[x-max]], [[y-max]].
+\item[Authors.] Each post has a [[user]], whose [[name]] we get by asking
+  for [[include=user]] with the posts.
+\end{description}
+One quirk shaped the code: FBF answers [[500]] when asked to include two
+relationships at once ([[include=user,annotation]]), so we fetch the
+annotations and fragments as lists of their own and join them ourselves.
+
+\begin{figure}
+\centering
+\begin{verbatim}
+activity --tasks--> multimedia-tasks --material--> multimedia/material
+material --comments--> comments --comments--> replies --> ...
+material --questions--> *-questions --answers--> *-answers
+*-choice-questions/answers --choices--> questions/choice
+material --annotations--> annotations: child = comment | question
+                                       parent = video-/document-fragment
+\end{verbatim}
+\caption{The resources of a discussion and their relationships.}
+\label{discussion-model}
+\end{figure}
+
+<<required names>>=
+requires("activities", attributes=["title"], relationships=["tasks"])
+requires("multimedia-tasks", relationships=["material"])
+requires("multimedia/material",
+         relationships=["comments", "questions", "annotations", "fragments"])
+requires("comments", attributes=["body", "created-at", "comments-count",
+                                 "upvotes-count"],
+         relationships=["user", "comments"])
+requires("open-questions", attributes=["body", "created-at",
+                                       "comments-count", "upvotes-count"],
+         relationships=["user", "comments", "answers"])
+requires("open-answers", attributes=["body", "created-at", "score",
+                                     "comments-count", "upvotes-count"],
+         relationships=["user", "comments"])
+for kind in ["multiple-choice-questions", "scratch-off-questions"]:
+    requires(kind, attributes=["body", "created-at", "comments-count",
+                               "upvotes-count"],
+             relationships=["user", "comments", "answers", "choices"])
+for kind in ["multiple-choice-answers", "scratch-off-answers"]:
+    requires(kind, attributes=["created-at", "score", "comments-count"],
+             relationships=["user", "comments", "choices"])
+requires("questions/choice", attributes=["body"])
+@
+
+These declarations are tangled into [[schema.py]] (\cref{Schema}), not into
+this module, so they name the types literally instead of using this
+module's constants.
+
+<<required names>>=
+requires("annotations", relationships=["parent", "child"])
+requires("video-fragments", attributes=["time-min", "time-max"])
+requires("document-fragments", attributes=["x-min", "x-max",
+                                           "y-min", "y-max"])
+requires("users", attributes=["name"])
+@
+
+The module separates fetching from assembling.
+Fetching follows the relationships above and returns resources; assembling
+turns resources into threads without touching the network.
+That split puts all the decisions where tests can reach them with
+resources shaped like FBF's.
+
+<<[[discussions.py]]>>=
+"""List the discussion threads of FeedbackFruits video and document activities."""
+
+<<imports>>
+
+<<constants>>
+
+<<classes>>
+
+<<functions>>
+@
+
+<<test [[discussions.py]]>>=
+from fbf.discussions import *
+
+<<test functions>>
+@
+
+
+\section{Posts and threads}
+
+A post is what a person wrote: an opening comment, a question, an answer or
+a reply.
+They share the attributes we need, so one class serves them all, and the
+[[kind]] tells them apart.
+A thread is an opening post, its place in the material, and the activity it
+belongs to.
+
+<<imports>>=
+import dataclasses
+<<classes>>=
+@dataclasses.dataclass
+class Post:
+    """A comment, question, answer or reply, with its replies."""
+
+    kind: str
+    author: str
+    created: str
+    body: str
+    upvotes: int = 0
+    score: float = None
+    replies: list = dataclasses.field(default_factory=list)
+
+    def count(self):
+        """Return the number of posts below this one."""
+        return sum(1 + reply.count() for reply in self.replies)
+
+
+@dataclasses.dataclass
+class Thread:
+    """An opening post and where it sits."""
+
+    activity: str
+    position: str
+    post: Post
+@
+
+The kind comes from the JSON:API type, in the singular and without the
+[[open-]] prefix, which is FBF's name for the question style.
+
+<<constants>>=
+CHOICE_QUESTIONS = ["multiple-choice-questions", "scratch-off-questions"]
+CHOICE_ANSWERS = ["multiple-choice-answers", "scratch-off-answers"]
+KINDS = {"comments": "comment", "open-questions": "question",
+         "open-answers": "answer",
+         **{kind: "question" for kind in CHOICE_QUESTIONS},
+         **{kind: "answer" for kind in CHOICE_ANSWERS}}
+<<functions>>=
+def make_post(resource, users, replies=(), reply=False, choices=None):
+    """Return the `Post` of a comment, question or answer `resource`.
+
+    `users` maps user ids to user resources, `choices` choice ids to
+    choice resources.  A comment given with `reply=True` is a reply.
+    """
+    kind = "reply" if reply else KINDS.get(resource["type"],
+                                           resource["type"])
+    user = users.get(related_id(resource, "user"))
+    attributes = resource.get("attributes") or {}
+    choice_answer = resource["type"] in CHOICE_ANSWERS
+    return Post(kind=kind,
+                author=attribute(user, "name") if user else "",
+                created=attribute(resource, "created-at"),
+                body=(chosen(resource, choices or {}) if choice_answer
+                      else attribute(resource, "body") or ""),
+                upvotes=(0 if choice_answer
+                         else attribute(resource, "upvotes-count") or 0),
+                score=attributes.get("score"),
+                replies=list(replies))
+@
+
+A choice answer's text is the text of the choices made.
+A choice we did not get (deleted since, say) is left out rather than
+failing the whole listing.
+
+<<functions>>=
+def chosen(answer, choices):
+    """Return the texts of the choices of a choice `answer`, joined."""
+    references = relationship(answer, "choices").get("data") or []
+    return "; ".join(attribute(choices[r["id"]], "body") or ""
+                     for r in references if r["id"] in choices)
+<<imports>>=
+from fbf.schema import attribute, related_id, requires
+@
+
+The score exists only on answers, hence the plain [[get]] for it.
+Choice answers lack a body and upvotes; the choices stand in for the body.
+Let's verify on resources shaped like FBF's, with made-up values.
+
+<<test functions>>=
+def resource(kind, id, user="u1", **attributes):
+  return {"type": kind, "id": id,
+          "attributes": {"body": "Text", "created-at": "2026-10-01T10:00Z",
+                         "upvotes-count": 2, "comments-count": 0,
+                         **attributes},
+          "relationships": {"user": {"data": {"type": "users", "id": user}},
+                            "comments": {"links": {"related": "/x"}}}}
+
+USERS = {"u1": {"type": "users", "id": "u1",
+                "attributes": {"name": "Ada Student"}}}
+
+def test_make_post_kinds_and_author():
+  answer = make_post(resource("open-answers", "a", score=1.0), USERS)
+  assert (answer.kind, answer.author, answer.score) \
+    == ("answer", "Ada Student", 1.0)
+  reply = make_post(resource("comments", "c", user="gone"), USERS, reply=True)
+  assert (reply.kind, reply.author) == ("reply", "")
+
+def test_make_post_choice_answer_uses_choices():
+  answer = {"type": "scratch-off-answers", "id": "a",
+            "attributes": {"created-at": "t", "score": 0.5,
+                           "comments-count": 0},
+            "relationships": {
+              "user": {"data": {"type": "users", "id": "u1"}},
+              "choices": {"data": [{"type": "questions/choice", "id": "k1"},
+                                   {"type": "questions/choice", "id": "k2"}]}}}
+  choices = {"k1": {"type": "questions/choice", "id": "k1",
+                    "attributes": {"body": "Yes"}}}
+  post = make_post(answer, USERS, choices=choices)
+  assert (post.kind, post.body, post.upvotes, post.score) \
+    == ("answer", "Yes", 0, 0.5)
+
+def test_post_count_counts_all_descendants():
+  leaf = Post("reply", "", "", "")
+  post = Post("comment", "", "", "", replies=[Post("reply", "", "", "",
+                                                   replies=[leaf]), leaf])
+  assert post.count() == 3
+@
+
+
+\section{Where a thread sits}
+
+A video position reads best as minutes and seconds, the way the player shows
+it.
+A document region has no such convention---its coordinates are FBF's
+internal ones---so we print the corners rounded, enough to sort threads and
+to find them again.
+Other fragment types we print by type, so that a new tool shows up instead
+of crashing.
+
+<<functions>>=
+def position(fragment):
+    """Return a readable position for a video or document `fragment`."""
+    if fragment is None:
+        return ""
+    if fragment["type"] == "video-fragments":
+        return (f"{clock(attribute(fragment, 'time-min'))}"
+                f"--{clock(attribute(fragment, 'time-max'))}")
+    if fragment["type"] == "document-fragments":
+        corners = [attribute(fragment, name)
+                   for name in ("x-min", "y-min", "x-max", "y-max")]
+        return "({:.2f},{:.2f})--({:.2f},{:.2f})".format(*corners)
+    return fragment["type"]
+
+
+def clock(seconds):
+    """Return `seconds` as `m:ss`."""
+    minutes, seconds = divmod(int(round(seconds or 0)), 60)
+    return f"{minutes}:{seconds:02d}"
+@
+
+<<test functions>>=
+def test_position():
+  video = {"type": "video-fragments",
+           "attributes": {"time-min": 62.4, "time-max": 70}}
+  document = {"type": "document-fragments",
+              "attributes": {"x-min": 0.1, "y-min": 1.234,
+                             "x-max": 0.5, "y-max": 1.3}}
+  assert position(video) == "1:02--1:10"
+  assert position(document) == "(0.10,1.23)--(0.50,1.30)"
+  assert position({"type": "audio-fragments"}) == "audio-fragments"
+  assert position(None) == ""
+@
+
+The annotations join a post to its fragment.
+We index them by the child's id, since we look them up from the post.
+
+<<functions>>=
+def anchors(annotations, fragments):
+    """Map post ids to their fragments through the `annotations`."""
+    by_id = {fragment["id"]: fragment for fragment in fragments}
+    return {related_id(annotation, "child"):
+            by_id.get(related_id(annotation, "parent"))
+            for annotation in annotations}
+@
+
+<<test functions>>=
+def test_anchors_join_posts_to_fragments():
+  fragment = {"type": "video-fragments", "id": "f"}
+  annotation = {"type": "annotations", "id": "n", "relationships": {
+    "child": {"data": {"type": "comments", "id": "c"}},
+    "parent": {"data": {"type": "video-fragments", "id": "f"}}}}
+  assert anchors([annotation], [fragment]) == {"c": fragment}
+@
+
+
+\section{Fetching a discussion}
+
+Fetching follows the model of \cref{discussion-model}.
+Each list of posts comes with its authors ([[include=user]]), and a post's
+replies are fetched only when its [[comments-count]] says there are any.
+
+<<functions>>=
+def fetch_posts(fbf, link, reply=False, choices=None):
+    """Return the `Post`s at the relationship `link`, replies included."""
+    document = fbf.get(link, include="user")
+    users = users_of(fbf, document)
+    return [make_post(resource, users, fetch_replies(fbf, resource),
+                      reply=reply, choices=choices)
+            for resource in document.resources]
+
+
+def fetch_replies(fbf, resource):
+    """Return the replies to a post `resource`, recursively."""
+    if not attribute(resource, "comments-count"):
+        return []
+    return fetch_posts(fbf, related_link(resource, "comments"), reply=True)
+@
+
+A question's answers are posts below it, like replies, but the question's
+replies proper (its [[comments]]) come too.
+We put the answers first, since they are what the question asked for.
+
+<<functions>>=
+def fetch_question(fbf, resource, users, choices=None):
+    """Return the `Post` of a question with its answers and replies."""
+    answers = fetch_posts(fbf, related_link(resource, "answers"),
+                          choices=choices)
+    return make_post(resource, users,
+                     answers + fetch_replies(fbf, resource))
+
+
+def related_link(resource, name):
+    """Return the `related` link of the relationship `name`."""
+    return (relationship(resource, name).get("links") or {})["related"]
+<<imports>>=
+from fbf.schema import relationship
+@
+
+A material's threads are its comments and its questions, each placed by the
+annotations.
+Opening comments become posts with their replies; questions go through
+[[fetch_question]], which adds the answers.
+
+<<functions>>=
+def material_threads(fbf, material, activity):
+    """Return the `Thread`s on a `material`, sorted by position."""
+    lists = {name: fbf.get(related_link(material, name)).resources
+             for name in ("annotations", "fragments")}
+    places = anchors(lists["annotations"], lists["fragments"])
+    comments = fbf.get(related_link(material, "comments"), include="user")
+    questions = fbf.get(related_link(material, "questions"), include="user")
+    choices = fetch_choices(fbf, questions.resources)
+    threads = [Thread(activity, position(places.get(resource["id"])),
+                      make_post(resource, users_of(fbf, comments),
+                                fetch_replies(fbf, resource)))
+               for resource in comments.resources]
+    threads += [Thread(activity, position(places.get(resource["id"])),
+                       fetch_question(fbf, resource,
+                                      users_of(fbf, questions),
+                                      choices))
+                for resource in questions.resources]
+    return sorted(threads, key=thread_order)
+
+
+@
+
+The authors should come with the posts, through [[include=user]].
+They do for comments, but the question and answer endpoints ignore the
+parameter and include nobody, so every question and answer would be
+anonymous.
+We therefore take the included users and fetch the missing ones by id, as
+FBF's web app does with [[v1/users?filter[id]=...]], in batches and keeping
+only the users we asked for.
+
+<<constants>>=
+BATCH = 50
+<<functions>>=
+def users_of(fbf, document):
+    """Map the ids of the authors in `document` to user resources."""
+    users = {id: user for (kind, id), user in document.included.items()
+             if kind == "users"}
+    missing = sorted({related_id(resource, "user")
+                      for resource in document.resources} - set(users)
+                     - {None})
+    for start in range(0, len(missing), BATCH):
+        batch = missing[start:start + BATCH]
+        found = fbf.get("v1/users", **{"filter[id]": ",".join(batch)})
+        users.update((user["id"], user) for user in found.resources
+                     if user["id"] in batch)
+    return users
+@
+
+The choices of all choice questions on a material are fetched together, by
+their ids.
+As with the users, we ask in batches, since a URL has a practical length
+limit, and keep only the choices we asked for.
+
+<<functions>>=
+def fetch_choices(fbf, questions):
+    """Map choice ids to the choices of the choice `questions`."""
+    wanted = [reference["id"] for question in questions
+              if question["type"] in CHOICE_QUESTIONS
+              for reference in relationship(question, "choices")
+                                .get("data") or []]
+    choices = {}
+    for start in range(0, len(wanted), BATCH):
+        batch = wanted[start:start + BATCH]
+        document = fbf.get("v1/questions/choices",
+                           **{"filter[id]": ",".join(batch)})
+        choices.update((choice["id"], choice)
+                       for choice in document.resources
+                       if choice["id"] in batch)
+    return choices
+@
+
+Sorting by position compares strings, which would put [[10:00]] before
+[[9:00]].
+We sort by the numbers in the position instead, then by time of posting.
+
+<<imports>>=
+import re
+<<functions>>=
+def thread_order(thread):
+    """Sort key for threads: numeric position, then creation time."""
+    numbers = [float(n) for n in re.findall(r"[0-9.]+", thread.position)
+               if n != "."]
+    return (numbers, thread.post.created)
+@
+
+<<test functions>>=
+def test_thread_order_is_numeric():
+  late = Thread("a", "10:00--10:05", Post("comment", "", "1", ""))
+  early = Thread("a", "9:00--9:05", Post("comment", "", "2", ""))
+  assert sorted([late, early], key=thread_order) == [early, late]
+@
+
+Finally, an activity's materials hang off its tasks, which come as bare
+references (see [[related]] in \cref{API}), so we ask for them with
+[[include=tasks.material]].
+
+<<functions>>=
+def activity_threads(fbf, activity_id, name=None):
+    """Return the `Thread`s of all materials of an activity.
+
+    `name` labels the threads; it defaults to the activity's title.
+    """
+    document = fbf.get(f"v1/activities/{activity_id}",
+                       include="tasks.material")
+    name = name or attribute(document.resource, "title")
+    return [thread
+            for (kind, _), material in document.included.items()
+            if kind == "multimedia/material"
+            for thread in material_threads(fbf, material, name)]
+@
+
+
+\section{Output}
+
+The output follows [[canvaslms]]: one row per item, fields separated by the
+delimiter, tab by default, so that it pipes into [[cut]], [[sort]] or a
+spreadsheet.
+By default a row is a thread: the activity, the position, the kind, the
+author, when, how many posts below it, the upvotes, and the text.
+With [[--long]] every post gets a row, with its depth in the thread, which
+is what reading a discussion needs.
+Line breaks in a body would break the rows, so we fold them into spaces.
+
+<<functions>>=
+def thread_rows(threads, long=False):
+    """Yield output rows (lists of strings) for `threads`."""
+    for thread in threads:
+        posts = walk(thread.post) if long else [(0, thread.post)]
+        for depth, post in posts:
+            yield [thread.activity, thread.position,
+                   post.kind,
+                   post.author, post.created,
+                   str(depth) if long else str(post.count()),
+                   str(post.upvotes),
+                   "" if post.score is None else str(post.score),
+                   " ".join(post.body.split())]
+
+
+def walk(post, depth=0):
+    """Yield `(depth, post)` for `post` and all posts below it."""
+    yield depth, post
+    for reply in post.replies:
+        yield from walk(reply, depth + 1)
+@
+
+<<test functions>>=
+def test_thread_rows_short_and_long():
+  reply = Post("reply", "Bo", "t2", "Me\ntoo")
+  thread = Thread("Week 1", "0:10--0:20",
+                  Post("comment", "Ada", "t1", "Why?", 3, replies=[reply]))
+  assert list(thread_rows([thread])) == [
+    ["Week 1", "0:10--0:20", "comment", "Ada", "t1", "1", "3", "", "Why?"]]
+  assert [row[2:6] + row[8:] for row in thread_rows([thread], long=True)] \
+    == [["comment", "Ada", "t1", "0", "Why?"],
+        ["reply", "Bo", "t2", "1", "Me too"]]
+@
+
+
+\section{The command}
+
+The command takes the [[canvaslms]] assignment options, launches FBF through
+the first FBF assignment among the selected, and lists the threads of each.
+Assignments that are not FBF's are skipped, so [[-c]] alone lists every
+discussion in a course.
+The threads are labelled with the Canvas assignment name, which is the name
+the user selected them by.
+
+<<imports>>=
+import json
+import sys
+import canvaslms.cli
+import canvaslms.cli.assignments
+import canvaslms.cli.cache
+import canvaslms.cli.login
+from fbf import canvas as fbfcanvas
+<<functions>>=
+def discussions_command(config, canvas, args):
+    """List the discussion threads of the selected FBF assignments."""
+    assignments = [a for a in
+                   canvaslms.cli.assignments.process_assignment_option(
+                       canvas, args)
+                   if fbfcanvas.placement_code(a)]
+    if not assignments:
+        raise canvaslms.cli.EmptyListError("No FeedbackFruits assignments")
+    hostname, token = canvaslms.cli.login.load_credentials(config)
+    fbf = fbfcanvas.connect(canvaslms.cli.cache.normalize_hostname(hostname),
+                            token, assignments)
+    threads = []
+    for assignment in assignments:
+        activity = fbfcanvas.activity_id(fbf,
+                                         fbfcanvas.placement_code(assignment))
+        if activity:
+            threads += activity_threads(fbf, activity, assignment.name)
+    <<output [[threads]] as [[args]] say>>
+@
+
+JSON output keeps the reply tree, which rows flatten.
+
+<<output [[threads]] as [[args]] say>>=
+if args.json:
+    json.dump([dataclasses.asdict(thread) for thread in threads],
+              sys.stdout, indent=2, ensure_ascii=False)
+    print()
+else:
+    delimiter = getattr(args, "delimiter", "\t")
+    for row in thread_rows(threads, long=args.long):
+        print(delimiter.join(row))
+@
+
+<<functions>>=
+def add_command(subp):
+    """Add the `discussions` command to `subp`."""
+    parser = subp.add_parser(
+        "discussions",
+        help="List discussion threads in FBF video and document activities",
+        description="List the threads of FeedbackFruits video and document "
+                    "activities: activity, position, kind, author, time, "
+                    "posts below (or depth with -l), upvotes, score, text.")
+    canvaslms.cli.assignments.add_assignment_option(parser, ungraded=False)
+    parser.add_argument("-l", "--long", action="store_true",
+                        help="one row per post instead of per thread")
+    parser.add_argument("--json", action="store_true",
+                        help="print threads with their replies as JSON")
+    parser.set_defaults(func=discussions_command)
+@

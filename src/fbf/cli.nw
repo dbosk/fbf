@@ -1,0 +1,150 @@
+\chapter{The command line}
+\label{CLI}
+
+The package is used from the shell as [[fbf]], and it is meant to become a
+command of [[canvaslms]] later, as [[canvaslms fbf]].
+Both should offer the same subcommands with the same options, so the
+subcommands are written to [[canvaslms]]'s conventions from the start: each
+module has an [[add_command(subp)]] that adds its parser, and each command
+is a function [[(config, canvas, args)]].
+This chapter assembles them twice: into the standalone [[fbf]] program, and
+into an [[fbf]] command that [[canvaslms]] can add with one line.
+
+<<[[cli.py]]>>=
+"""The fbf command line, standalone or inside canvaslms."""
+
+<<imports>>
+
+<<constants>>
+
+<<functions>>
+@
+
+
+\section{The subcommands}
+
+Every chapter that provides a command contributes it here.
+
+<<imports>>=
+import fbf.discussions
+import fbf.har
+<<functions>>=
+def add_subcommands(subp):
+    """Add all fbf subcommands to the argparse subparsers `subp`."""
+    fbf.discussions.add_command(subp)
+    fbf.har.add_command(subp)
+    for parser in subp.choices.values():
+        parser.set_defaults(func=reporting_errors(parser.get_default("func")))
+@
+
+The [[for]] loop wraps every command so that our errors end the program with
+their message, not a traceback.
+The messages were written for the user: a [[LaunchError]] names the hop, a
+[[SchemaError]] the missing name and the recovery procedure.
+A traceback would bury them, and [[canvaslms]] only reports its own errors
+this way.
+The wrapper keeps the original function in [[__wrapped__]], which the
+standalone program uses below.
+
+<<imports>>=
+import functools
+import canvaslms.cli
+from fbf.api import APIError
+from fbf.launch import LaunchError
+from fbf.schema import SchemaError
+<<constants>>=
+REPORTED_ERRORS = (LaunchError, APIError, SchemaError, LookupError)
+<<functions>>=
+def reporting_errors(command):
+    """Wrap `command` to exit with the message of our errors."""
+    @functools.wraps(command)
+    def wrapper(config, canvas, args):
+        try:
+            return command(config, canvas, args)
+        except REPORTED_ERRORS as error:
+            canvaslms.cli.err(1, str(error))
+    return wrapper
+@
+
+
+\section{Inside [[canvaslms]]}
+
+For [[canvaslms]] we add a single [[fbf]] command with the subcommands below
+it, so that they do not mix with [[canvaslms]]'s own.
+[[canvaslms]] then needs only
+\begin{center}
+[[fbf.cli.add_command(subp)]]
+\end{center}
+among its other commands, preferably guarded by a [[try]] around the import,
+so that [[fbf]] stays optional.
+
+<<functions>>=
+def add_command(subp):
+    """Add the `fbf` command, with its subcommands, to `subp`."""
+    parser = subp.add_parser(
+        "fbf", help="Detailed data from FeedbackFruits",
+        description="Detailed data from FeedbackFruits activities.")
+    add_subcommands(parser.add_subparsers(
+        title="fbf commands", dest="fbf_command", required=True))
+@
+
+
+\section{The standalone program}
+
+The standalone program does what [[canvaslms]]'s [[main]] does for its
+commands, reusing its parts.
+It reads the same configuration file, so that [[canvaslms login]] is all the
+setup [[fbf]] needs.
+It takes the same global options for the configuration file and the
+delimiter.
+
+<<imports>>=
+import argparse
+import canvaslms
+import canvaslms.cli.cache
+<<functions>>=
+def main():
+    """Run the standalone `fbf` program."""
+    argp = argparse.ArgumentParser(
+        prog="fbf",
+        description="Detailed data from FeedbackFruits, through Canvas.")
+    argp.add_argument(
+        "-f", "--config-file",
+        default=f"{canvaslms.dirs.user_config_dir}/config.json",
+        help="canvaslms configuration file, run `canvaslms login` to set up")
+    argp.add_argument("-d", "--delimiter", default="\t",
+                      help="field delimiter, default tab")
+    add_subcommands(argp.add_subparsers(
+        title="commands", dest="command", required=True))
+    args = argp.parse_args()
+    config = canvaslms.cli.read_configuration(args.config_file)
+    <<run [[args.func]], with Canvas if it needs it>>
+@
+
+The HAR commands read files and need no Canvas; creating a Canvas object
+for them would demand credentials for nothing.
+We recognise them by the wrapped function.
+The others get the Canvas object from [[canvaslms]]'s cache, which also
+caches course and assignment lists between runs, so we save it afterwards as
+[[canvaslms]] does.
+
+<<constants>>=
+COMMANDS_WITHOUT_CANVAS = {fbf.har.har_shape_command,
+                           fbf.har.har_diff_command}
+<<run [[args.func]], with Canvas if it needs it>>=
+if args.func.__wrapped__ in COMMANDS_WITHOUT_CANVAS:
+    args.func(config, None, args)
+    return
+try:
+    canvas, hostname, token = canvaslms.cli.cache.load_configured_canvas(
+        config)
+except canvaslms.cli.cache.CanvasCredentialsError as error:
+    canvaslms.cli.err(1, str(error))
+try:
+    args.func(config, canvas, args)
+except (canvaslms.cli.EmptyListError,
+        canvaslms.cli.MultipleMatchesError) as error:
+    canvaslms.cli.err(1, str(error))
+finally:
+    canvaslms.cli.cache.save_canvas_cache(canvas, token, hostname)
+@

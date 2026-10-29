@@ -19,9 +19,13 @@ exclude = [
   "*/**/__pycache__"
 ]
 
+[tool.poetry.scripts]
+fbf = "fbf.cli:main"
+
 [tool.poetry.dependencies]
 python = "^3.10"
 requests = "^2.31"
+canvaslms = ">=6.24"
 
 [tool.poetry.group.dev.dependencies]
 pytest = "^8.1.1"
