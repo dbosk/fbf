@@ -1824,8 +1824,21 @@ in that cassette's titles.
 Allowing them in every cassette would hide a real leak of the same words
 elsewhere; within one cassette, the same words in another field go
 unreported, which is the price of not reading the cassettes by eye.
+
+Not every title is course content, though.
+A title that a student gives, such as the file name of a submission, can
+hold the student's name, and then the allowance would hide the very leak
+that the scan exists to find: the title and every other place of the name
+in that cassette.
+So only the titles of the resources that teachers write count: activities,
+criteria and the levels of a rubric.
+The recordings have titles on no other types today; a new one makes the
+scan report its titles until we have looked at them and added the type
+here.
 <<constants for the tests>>=
-PUBLIC_TEXT_KEYS = {"title"}
+TITLED_CONTENT_TYPES = {"activities", "assignments/criterion",
+                        "assignments/rubric-criterion",
+                        "assignments/criterion-option"}
 <<checks after the run>>=
 def leaks_in_recordings(pairs, originals_path):
     """Return `(path, where, kind, redacted hit)` for every leak in the
@@ -1854,22 +1867,24 @@ def public_originals(needles, cassette):
             body = json.loads(text or "")
         except ValueError:
             continue
-        for title in strings_under(body, PUBLIC_TEXT_KEYS):
+        for title in content_titles(body):
             found |= {match for _, _, match in needles.finditer(title)}
     return sorted(found)
 
 
-def strings_under(data, keys):
-    """Yield the strings in `data` that are values of one of `keys`."""
+def content_titles(data):
+    """Yield the titles of the course-content resources anywhere in `data`."""
     if isinstance(data, dict):
-        for key, value in data.items():
-            if key in keys and isinstance(value, str):
-                yield value
-            else:
-                yield from strings_under(value, keys)
+        kind, attributes = data.get("type"), data.get("attributes")
+        if (isinstance(kind, str) and kind in TITLED_CONTENT_TYPES
+                and isinstance(attributes, dict)
+                and isinstance(attributes.get("title"), str)):
+            yield attributes["title"]
+        for value in data.values():
+            yield from content_titles(value)
     elif isinstance(data, list):
         for item in data:
-            yield from strings_under(item, keys)
+            yield from content_titles(item)
 <<report the personal data in the recordings>>=
 leaks = leaks_in_recordings(pairs, getattr(config, "_originals_path", None))
 if leaks:
@@ -1930,8 +1945,9 @@ def test_leak_scan_allows_originals_only_in_the_titles_cassette(tmp_path):
   originals.write_text("Clear structure\n")
   criteria = tmp_path / "criteria"
   write_interaction(criteria / "c.yaml", "https://api.example.com/v1/c",
-                    json.dumps({"data": [{"attributes": {
-                      "title": "Clear structure (2 points)"}}]}),
+                    json.dumps({"data": [{
+                      "type": "assignments/criterion", "id": "c1",
+                      "attributes": {"title": "Clear structure (2 points)"}}]}),
                     "application/json")
   assert leak_kinds(criteria, originals) == []
   answers = tmp_path / "answers"
@@ -1939,6 +1955,17 @@ def test_leak_scan_allows_originals_only_in_the_titles_cassette(tmp_path):
                     json.dumps({"data": [{"attributes": {
                       "note2": "Clear structure"}}]}), "application/json")
   assert leak_kinds(answers, originals) == ["original"]
+
+def test_leak_scan_takes_titles_only_of_course_content(tmp_path):
+  originals = tmp_path / "originals.txt"
+  originals.write_text("Anna Andersson\n")
+  submissions = tmp_path / "submissions"
+  write_interaction(submissions / "s.yaml", "https://api.example.com/v1/s",
+                    json.dumps({"data": [{
+                      "type": "assignments/submission", "id": "s1",
+                      "attributes": {"title": "Anna Andersson report.pdf"}}]}),
+                    "application/json")
+  assert leak_kinds(submissions, originals) == ["original"]
 
 def test_leak_scan_allows_uuids_but_not_tokens_or_originals(tmp_path):
   cassettes = tmp_path / "cassettes"
