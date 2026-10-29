@@ -17,6 +17,9 @@ Literate programs (noweb). Edit the `.nw` files, never the tangled `.py`/`.tex`
   placement code), one launch for all.
 - `src/fbf/discussions.nw`: `fbf discussions`: threads in video/document
   activities (comments, questions, answers, replies, positions).
+- `src/fbf/reviews.nw`: `fbf reviews`: peer reviews of peerfeedback
+  activities (levels, scores, comments; `--feedback`, `--reflections`);
+  documents the endpoints never to call.
 - `src/fbf/cli.nw`: standalone `fbf` and `add_command(subp)` for canvaslms;
   commands follow canvaslms's `(config, canvas, args)` convention.
 - `src/fbf/har.nw`: `har-shape`/`har-diff`: value-free shapes of HAR captures;
