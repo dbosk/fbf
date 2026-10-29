@@ -334,12 +334,19 @@ def insert_text(insert):
 
 def emoji(embed):
     """Return the character of a Quill emoji `embed`, or `:name:`."""
+    if not isinstance(embed, dict):
+        return f":{embed}:" if isinstance(embed, str) and embed else ""
     try:
         return "".join(chr(int(code, 16))
                        for code in embed["unicode"].split("-"))
     except (KeyError, ValueError, AttributeError):
         return f":{embed.get('name', '')}:"
 @
+
+Other Quill setups give an emoji as its name only, a string, so we show
+that name between colons as well; and a code beyond Unicode's range is
+handled like one that is not a number.
+Either way a strange emoji costs a character, not the listing.
 
 <<test functions>>=
 def test_plain_text_of_strings_and_deltas():
@@ -358,6 +365,9 @@ def test_plain_text_of_strings_and_deltas():
 def test_emoji_composed_and_unreadable():
   assert emoji({"unicode": "1f44d-1f3fb"}) == "\U0001F44D\U0001F3FB"
   assert emoji({"name": "smile", "unicode": "?"}) == ":smile:"
+  assert emoji({"name": "big", "unicode": "f" * 40}) == ":big:"
+  assert insert_text({"emoji": "smile"}) == ":smile:"
+  assert insert_text({"emoji": None}) == ""
 @
 
 
