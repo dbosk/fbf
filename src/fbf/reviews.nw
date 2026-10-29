@@ -832,6 +832,7 @@ def test_make_reflections_reads_deltas_and_sorts_by_student():
 
 
 \section{The fetchers, offline}
+\label{fake-fbf}
 
 The fetchers decide which requests to send and join what comes back, and
 those decisions need tests that run everywhere.
@@ -1082,15 +1083,10 @@ assignments in their course round (\cref{Canvas}), and lists what was
 written in each.
 Assignments that are not FBF's are dropped, so [[-c]] alone lists every
 peer review in a course.
-FBF activities that are not peer reviews, those not yet opened this round,
-and, with [[--feedback]], peer reviews without reviewer feedback, are
-skipped with a note on standard error.
 Everything is labelled with the Canvas assignment name, by which the user
 selected it, and comes in the order of the assignments.
-
-The three views share all of this and differ in what they fetch and how
-they print it, so the command picks a fetcher and a row maker by the
-options.
+The command itself is only the glue to [[canvaslms]]; the decisions are in
+the functions it calls, where the tests can reach them.
 
 <<imports>>=
 import json
@@ -1109,35 +1105,89 @@ def reviews_command(config, canvas, args):
                    if fbfcanvas.placement_code(a)]
     if not assignments:
         raise canvaslms.cli.EmptyListError("No FeedbackFruits assignments")
-    fetch = (fetch_feedback if args.feedback
-             else fetch_reflections if args.reflections
-             else fetch_reviews)
     hostname, token = canvaslms.cli.login.load_credentials(config)
     items = []
     for assignment, fbf, activity in fbfcanvas.fbf_activities(
             canvaslms.cli.cache.normalize_hostname(hostname), token,
             assignments):
-        <<add the [[items]] of [[activity]], or say why not>>
+        try:
+            items += activity_items(fbf, activity, assignment.name, args)
+        except Skipped as reason:
+            print(f"{assignment.name}: {reason}, skipped", file=sys.stderr)
     <<output [[items]] as [[args]] say>>
 @
 
-<<add the [[items]] of [[activity]], or say why not>>=
-tasks = peer_review_tasks(fbf, activity) if activity else None
-if not activity:
-    skipped(assignment, "not opened in FeedbackFruits this course round")
-elif not tasks:
-    skipped(assignment, "not a peer review")
-elif args.feedback and not feedback_enabled(tasks):
-    skipped(assignment, "reviewer feedback is not enabled")
-else:
-    items += fetch(fbf, tasks, assignment.name)
+\subsection{What an activity gives}
+
+Three kinds of activity give nothing, and the user should learn why rather
+than see them missing: FBF activities that are not peer reviews, those not
+yet opened this round, and, with [[--feedback]], peer reviews without
+reviewer feedback.
+[[activity_items]] raises [[Skipped]] with the reason for them, which the
+command prints on standard error; it is not an error, so the other
+activities are still listed.
+The three views share everything else and differ in what they fetch, so
+[[fetcher]] picks the fetch function by the options.
+
+<<classes>>=
+class Skipped(Exception):
+    """An activity that gives nothing in the selected view, and why."""
 <<functions>>=
-def skipped(assignment, reason):
-    """Note on standard error that `assignment` is skipped and why."""
-    print(f"{assignment.name}: {reason}, skipped", file=sys.stderr)
+def activity_items(fbf, activity, name, args):
+    """Return the items of `activity` in the view that `args` select.
+
+    `name` labels the items.  Raises `Skipped` with the reason when the
+    activity has nothing to give.
+    """
+    if not activity:
+        raise Skipped("not opened in FeedbackFruits this course round")
+    tasks = peer_review_tasks(fbf, activity)
+    if not tasks:
+        raise Skipped("not a peer review")
+    if args.feedback and not feedback_enabled(tasks):
+        raise Skipped("reviewer feedback is not enabled")
+    return fetcher(args)(fbf, tasks, name)
+
+
+def fetcher(args):
+    """Return the fetch function of the view that `args` select."""
+    return (fetch_feedback if args.feedback
+            else fetch_reflections if args.reflections
+            else fetch_reviews)
 @
 
+The fake course of \cref{fake-fbf} serves all of these cases.
+A namespace with the options stands in for the parsed command line, and
+the skip for disabled feedback must not cost more than the request for
+the tasks.
+
+<<test functions>>=
+import argparse
+
+def view(**options):
+  return argparse.Namespace(**{"feedback": False, "reflections": False,
+                               "long": False, **options})
+
+def test_activity_items_picks_the_view_and_says_why_it_skips():
+  fbf = course_with_a_peer_review()
+  for options, kind in [({}, Review), ({"feedback": True}, Feedback),
+                        ({"reflections": True}, Reflection)]:
+    items = activity_items(fbf, "act", "Essay", view(**options))
+    assert [type(item) for item in items] == [kind, kind]
+  with pytest.raises(Skipped, match="not opened"):
+    activity_items(fbf, None, "Essay", view())
+  with pytest.raises(Skipped, match="not a peer review"):
+    activity_items(fbf, "video", "Essay", view())
+  off = course_with_a_peer_review(feedback_on=False)
+  with pytest.raises(Skipped, match="not enabled"):
+    activity_items(off, "act", "Essay", view(feedback=True))
+  assert off.asked == ["v1/activities/act"]
+@
+
+\subsection{Output and options}
+
 JSON output keeps each review's comments as a list, which rows flatten.
+Otherwise [[rows]] picks the row maker of the view.
 
 <<output [[items]] as [[args]] say>>=
 if args.json:
@@ -1145,12 +1195,27 @@ if args.json:
               sys.stdout, indent=2, ensure_ascii=False)
     print()
 else:
-    rows = (feedback_rows(items) if args.feedback
-            else reflection_rows(items) if args.reflections
-            else review_rows(items, long=args.long))
     delimiter = getattr(args, "delimiter", "\t")
-    for row in rows:
+    for row in rows(items, args):
         print(delimiter.join(row))
+<<functions>>=
+def rows(items, args):
+    """Return the output rows of `items` in the view that `args` select."""
+    if args.feedback:
+        return feedback_rows(items)
+    if args.reflections:
+        return reflection_rows(items)
+    return review_rows(items, long=args.long)
+@
+
+<<test functions>>=
+def test_rows_follow_the_view():
+  assert [len(row) for row in rows(REVIEWS, view())] == [7, 7]
+  assert [len(row) for row in rows(REVIEWS, view(long=True))] == [9, 9, 9]
+  assert list(rows([Feedback("E", "Ada", "Bo", 4, "")],
+                   view(feedback=True))) == [["E", "Ada", "Bo", "4", ""]]
+  assert list(rows([Reflection("E", "Ada", "Fun")],
+                   view(reflections=True))) == [["E", "Ada", "Fun"]]
 @
 
 The views exclude each other, which [[argparse]] enforces.
@@ -1179,6 +1244,24 @@ def add_command(subp):
     parser.add_argument("--json", action="store_true",
                         help="print as JSON, reviews with their comments")
     parser.set_defaults(func=reviews_command)
+@
+
+The parser is checked as the user meets it, through a real [[argparse]]
+parser with the command added.
+
+<<test functions>>=
+def parse(*arguments):
+  parser = argparse.ArgumentParser(prog="fbf")
+  add_command(parser.add_subparsers())
+  return parser.parse_args(["reviews", *arguments])
+
+def test_add_command_parses_the_views_and_refuses_two():
+  args = parse("-l", "--feedback")
+  assert (args.long, args.feedback, args.reflections, args.json) \
+    == (True, True, False, False)
+  assert args.func is reviews_command
+  with pytest.raises(SystemExit):
+    parse("--feedback", "--reflections")
 @
 
 
