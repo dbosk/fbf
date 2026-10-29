@@ -404,19 +404,21 @@ def match_actors(emails, students):
     return matched
 @
 
-The matching is case insensitive and takes either Canvas field, and an
-actor that is not a student (here a teacher) is not matched.
+The matching is case insensitive on both sides and takes either Canvas
+field, an address that matches nobody (an old one, say) does not stop the
+next from matching, and an actor that is not a student (here a teacher)
+is not matched.
 
 <<test functions>>=
 STUDENTS = [SimpleNamespace(id=1, login_id="ada@example.com",
                             email="ada@example.com"),
-            SimpleNamespace(id=2, login_id="bo@example.com", email=None),
+            SimpleNamespace(id=2, login_id="Bo@Example.com", email=None),
             SimpleNamespace(id=3, login_id=None, email="cy@example.com")]
 
 def test_match_actors_by_email_or_login():
   matched = match_actors({"a1": {"Ada@Example.com"},
                           "a2": {"bo@example.com"},
-                          "a3": {"old@example.com", "cy@example.com"},
+                          "a3": {"alumni@example.com", "cy@example.com"},
                           "teacher": {"t@example.com"}}, STUDENTS)
   assert {actor: s.id for actor, s in matched.items()} \
     == {"a1": 1, "a2": 2, "a3": 3}
@@ -462,7 +464,8 @@ who dropped out---get no row, since Canvas has no grade of theirs to
 explain.
 
 The student is named by the Canvas login, which is what the other
-[[canvaslms]] commands show.
+[[canvaslms]] commands show, and the rows are sorted by it, ignoring case,
+so that a login with capitals does not jump ahead of the others.
 Of the arguments, [[scores]] maps Canvas user ids to their scores in the
 assignment, and [[sent]] maps the ids of the grades sent to the
 [[lti/grade]] resources.
@@ -491,7 +494,7 @@ def assemble(assignment, tasks, progresses, sent, student_of, students,
                 points_possible=assignment.points_possible,
                 student=student_name(student), canvas_user_id=student.id,
                 canvas_score=scores.get(student.id))
-    return sorted(rows.values(), key=lambda row: row.student)
+    return sorted(rows.values(), key=lambda row: row.student.lower())
 
 
 def student_name(student):
