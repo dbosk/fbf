@@ -967,13 +967,19 @@ under [[user]].
 A user also has a [[zendesk-hash]], which FBF's web app hands to its help
 desk to prove who the user is: a credential, not data.
 The launch and the token renewal carry tokens as JSON values too.
+So does Canvas: a course (and a user) comes with the address of its
+calendar feed, under [[calendar]] and [[ics]], as
+[[/feeds/calendars/course_]]\ldots[[.ics]] with a long token in the name.
+That address is a capability link: whoever has it reads the calendar,
+without logging in.
+The first real recording held one, which the scan rightly reported.
 Such values are replaced by a placeholder wherever their key occurs.
 <<scrubbing for FBF>>=
 FBF_PERSON_TYPES = {"users"}
 FBF_SECRET_KEYS = kebab({
     "access_token", "refresh_token", "id_token", "session_token",
     "login_hint", "lti_message_hint", "authenticity_token", "csrf_token",
-    "secure_params", "zendesk_hash"})
+    "secure_params", "zendesk_hash", "ics"})
 
 
 def is_person_resource(obj):
@@ -1061,6 +1067,11 @@ def test_recordings_replace_fbfs_own_fields(scrubber):
   assert email.endswith("@example.invalid")
   activity = scrubbed["included"][-1]["attributes"]
   assert activity == {"title": "Peer review 1", "name": "Peer review 1"}
+
+def test_recordings_replace_calendar_feeds(scrubber):
+  course = {"id": 1, "name": "Course", "calendar": {
+    "ics": "https://canvas.example.com/feeds/calendars/course_Ab3dEf6.ics"}}
+  assert scrubber.scrub_json(course)["calendar"] == {"ics": "redacted"}
 @
 
 \subsubsection{Titles in Canvas objects}
@@ -1741,8 +1752,13 @@ They are identifiers, not credentials: FBF answers only requests that carry
 a bearer token.
 So we allow hits that are exactly a UUID, and only those; a token that
 merely contains one is still reported.
+One more form of a UUID turned up in the first real recording.
+[[get_by_ids]] asks for several resources with [[filter[id]=]]\emph{a}[[,]]%
+\emph{b}, and in the URL the comma is written [[%2C]], so the scan saw
+[[2C]] followed by a UUID as one token.
+We allow that form too: it is the same identifier.
 <<constants for the tests>>=
-ALLOWED_HITS = ["re:[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}"
+ALLOWED_HITS = ["re:(?:2[Cc])?[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}"
                 "-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"]
 <<checks after the run>>=
 def leaks_in_recordings(pairs, originals_path):
@@ -1818,12 +1834,15 @@ def test_leak_scan_allows_uuids_but_not_tokens_or_originals(tmp_path):
   originals.write_text("Andersson\n")
   write_interaction(cassettes / "uuid.yaml", "https://api.example.com/v1/"
                     "activities/340a516d-0000-4000-8000-000000000002")
+  write_interaction(cassettes / "ids.yaml", "https://api.example.com/v1/"
+                    "users?filter%5Bid%5D=340a516d-0000-4000-8000-000000000002"
+                    "%2C340a516d-0000-4000-8000-000000000003")
   assert leak_kinds(cassettes, originals) == []
   write_interaction(cassettes / "token.yaml",
-                    "https://api.example.com/v1/x?q=Ab3dEf6hIj9kLm2nOp5qRs8tUv1wXy4z")
+                    "https://api.example.com/v1/x?q=2CAb3dEf6hIj9kLm2nOp5qRs8tUv1wXy4z")
   write_interaction(cassettes / "name.yaml", "https://api.example.com/v1/x",
                     body="Ask Andersson.")
-  assert leak_kinds(cassettes, originals) == ["original", "url-token"]
+  assert set(leak_kinds(cassettes, originals)) == {"original", "url-token"}
 @
 
 The comparison we test the same way: a key that the committed cassette has
