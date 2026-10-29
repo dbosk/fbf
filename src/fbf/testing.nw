@@ -1275,10 +1275,14 @@ def pytest_sessionfinish(session, exitstatus):
         else:
             print(message)
 
-    <<scan the recordings for personal data>>
+    <<report the personal data in the recordings>>
     if config.getoption("--live"):
-        <<compare the live recordings with the cassettes>>
+        <<report the drift of the live recordings>>
 @
+
+The scan and the comparison are functions of their own, so that we can test
+them on files we write ourselves; the hook above only reports what they find
+and sets the exit status.
 
 The scan takes any long run of letters and digits in a URL for a token,
 since capability links look like that.
@@ -1292,16 +1296,21 @@ merely contains one is still reported.
 <<constants for the tests>>=
 ALLOWED_HITS = ["re:[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}"
                 "-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"]
-<<scan the recordings for personal data>>=
-originals = vcr_support.Needles(
-    vcr_support.read_list(getattr(config, "_originals_path", None)))
-leaks = []
-for _, written in sorted(pairs):
-    for path in vcr_support.iter_files([written]):
-        if path.name != LIVE_MARKER_FILE:
-            leaks += [(path, where, kind, hit) for where, kind, hit
-                      in vcr_support.scan_file(path, originals,
-                                               allow=ALLOWED_HITS)]
+<<checks after the run>>=
+def leaks_in_recordings(pairs, originals_path):
+    """Return `(path, where, kind, redacted hit)` for every leak in the
+    directories that the run recorded into."""
+    originals = vcr_support.Needles(vcr_support.read_list(originals_path))
+    leaks = []
+    for _, written in sorted(pairs):
+        for path in vcr_support.iter_files([written]):
+            if path.name != LIVE_MARKER_FILE:
+                leaks += [(path, where, kind, hit) for where, kind, hit
+                          in vcr_support.scan_file(path, originals,
+                                                   allow=ALLOWED_HITS)]
+    return leaks
+<<report the personal data in the recordings>>=
+leaks = leaks_in_recordings(pairs, getattr(config, "_originals_path", None))
 if leaks:
     write("PRIVACY: the recordings contain personal data or secrets (values "
           "redacted below). Extend the key lists in testing.nw, delete the "
@@ -1311,11 +1320,20 @@ if leaks:
     session.exitstatus = 1
 @
 
-<<compare the live recordings with the cassettes>>=
-drift = []
-for committed, live in sorted(pairs):
-    if committed.exists() and live.exists():
-        drift += vcr_support.compare_directories(committed, live)
+The comparison pairs each committed directory with its live twin.
+A directory that only one side has was not exercised by both runs, and
+[[vcr_support]] cannot compare it.
+<<checks after the run>>=
+def drift_between(pairs):
+    """Return `(severity, cassette, request, message)` for every structural
+    difference between the committed and the live cassettes of `pairs`."""
+    findings = []
+    for committed, live in sorted(pairs):
+        if committed.exists() and live.exists():
+            findings += vcr_support.compare_directories(committed, live)
+    return findings
+<<report the drift of the live recordings>>=
+drift = drift_between(pairs)
 for severity, name, key, message in drift:
     if message != "not re-recorded in the live run":
         write(f"  {severity}: {name} {key}: {message}",
@@ -1327,6 +1345,137 @@ if any(severity == "drift" for severity, *_ in drift):
     session.exitstatus = 1
 else:
     write(f"live: no structural drift ({config._live_dir})", green=True)
+@
+
+Let's verify the scan on cassettes that we write by hand.
+A URL whose only long token is a UUID passes; a URL with a long random token
+does not, nor does a name that the pseudonymizer replaced while recording.
+The token and the name are made up.
+<<test functions>>=
+def write_interaction(path, uri, body="", content_type="text/plain"):
+  path.parent.mkdir(parents=True, exist_ok=True)
+  path.write_text(json.dumps({"version": 1, "interactions": [{
+    "request": {"method": "GET", "uri": uri, "body": None, "headers": {}},
+    "response": {"status": {"code": 200, "message": "OK"},
+                 "headers": {"Content-Type": [content_type]},
+                 "body": {"string": body}}}]}))
+
+def leak_kinds(directory, originals):
+  return sorted(kind for *_, kind, _ in conftest.leaks_in_recordings(
+    {(directory, directory)}, originals))
+
+def test_leak_scan_allows_uuids_but_not_tokens_or_originals(tmp_path):
+  cassettes = tmp_path / "cassettes"
+  originals = tmp_path / "originals.txt"
+  originals.write_text("Andersson\n")
+  write_interaction(cassettes / "uuid.yaml", "https://api.example.com/v1/"
+                    "activities/340a516d-0000-4000-8000-000000000002")
+  assert leak_kinds(cassettes, originals) == []
+  write_interaction(cassettes / "token.yaml",
+                    "https://api.example.com/v1/x?q=Ab3dEf6hIj9kLm2nOp5qRs8tUv1wXy4z")
+  write_interaction(cassettes / "name.yaml", "https://api.example.com/v1/x",
+                    body="Ask Andersson.")
+  assert leak_kinds(cassettes, originals) == ["original", "url-token"]
+@
+
+The comparison we test the same way: a key that the committed cassette has
+and the live one lacks is drift.
+<<test functions>>=
+def test_drift_reports_a_removed_key(tmp_path):
+  committed, live = tmp_path / "committed", tmp_path / "live"
+  uri = "https://api.example.com/v1/users/current"
+  write_interaction(committed / "a.yaml", uri, json.dumps({"kept": 1,
+                    "gone": 1}), "application/json")
+  write_interaction(live / "a.yaml", uri, json.dumps({"kept": 1}),
+                    "application/json")
+  findings = conftest.drift_between({(committed, live)})
+  assert [(severity, message) for severity, _, _, message in findings] \
+    == [("drift", "removed $.gone")]
+@
+
+The functions finding the right things is not enough: the run must also
+fail.
+So we run [[pytest]] on a test that records from a small HTTP server of our
+own on [[127.0.0.1]], which [[--block-network]] lets through.
+The server answers [[/token]] with a token-shaped value under a key that no
+scrubber knows, which the scan must catch, and [[/data]] with a body whose
+key differs from that of the cassette we write for it, which the live
+comparison must catch.
+The token is assembled at run time, so that this source file holds no
+token-shaped string for our own scans to find.
+As in the other inner runs, the inner tests replace the launch fixture, so
+they never contact Canvas.
+<<test functions>>=
+FAKE_JWT = ".".join(["eyJ" + "hbGciOiJub25lIn0", "eyJ" + "zdWIiOiJ0ZXN0In0",
+                     "c2lnbmF0dXJl" + "LXRlc3Q"])
+
+@pytest.fixture
+def local_service(monkeypatch):
+  import http.server
+  import threading
+
+  class Handler(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+      body = {"/token": {"reference": FAKE_JWT},
+              "/data": {"renamed": 1}}[self.path]
+      payload = json.dumps(body).encode("utf-8")
+      self.send_response(200)
+      self.send_header("Content-Type", "application/json")
+      self.send_header("Content-Length", str(len(payload)))
+      self.end_headers()
+      self.wfile.write(payload)
+
+    def log_message(self, *args):
+      pass
+
+  server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+  thread = threading.Thread(target=server.serve_forever, daemon=True)
+  thread.start()
+  url = f"http://127.0.0.1:{server.server_address[1]}"
+  monkeypatch.setenv("FBF_TEST_SERVICE", url)
+  monkeypatch.setenv("TEST_PSEUDONYM_KEY", "a key for the inner run")
+  yield url
+  server.shutdown()
+
+RECORDING_TESTS = """
+import os
+
+import pytest
+import requests
+
+@pytest.fixture(scope="session", autouse=True)
+def launched():
+  return "the inner run never launches"
+
+@pytest.mark.vcr
+def test_fetch():
+  requests.get(os.environ["FBF_TEST_SERVICE"] + os.environ["FBF_TEST_PATH"])
+"""
+
+def test_a_recording_with_a_secret_fails_the_run(
+    pytester, local_service, monkeypatch):
+  monkeypatch.setenv("FBF_TEST_PATH", "/token")
+  pytester.makeconftest(file_text(conftest.__file__))
+  pytester.makepyfile(test_inner=RECORDING_TESTS)
+  result = pytester.runpytest_inprocess(
+    "--record-mode=once", "-p", "no:cacheprovider")
+  result.assert_outcomes(passed=1)
+  assert result.ret == 1
+  result.stdout.fnmatch_lines(["*PRIVACY*", "*jwt*"])
+
+def test_drift_fails_a_live_run(
+    pytester, local_service, monkeypatch, tmp_path):
+  monkeypatch.setenv("FBF_TEST_PATH", "/data")
+  pytester.makeconftest(file_text(conftest.__file__))
+  pytester.makepyfile(test_inner=RECORDING_TESTS)
+  write_interaction(pytester.path / "cassettes" / "test_inner"
+                    / "test_fetch.yaml", local_service + "/data",
+                    json.dumps({"kept": 1}), "application/json")
+  result = pytester.runpytest_inprocess(
+    "--live", f"--live-dir={tmp_path / 'live'}", "-p", "no:cacheprovider")
+  result.assert_outcomes(passed=1)
+  assert result.ret == 1
+  result.stdout.fnmatch_lines(["*drift*removed $.kept*", "*DRIFT*"])
 @
 
 
