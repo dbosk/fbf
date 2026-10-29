@@ -211,8 +211,8 @@ The launched activity has one: its [[placement]] relationship refers to it,
 and FBF includes it when asked.
 <<example fetchers>>=
 @example("lti/placement")
-def placement_of_the_launched_activity(fbf, launched):
-    document = fbf.get(f"v1/activities/{launched.activity_uuid}",
+def placement_of_the_launched_activity(fbf, login):
+    document = fbf.get(f"v1/activities/{login.activity_uuid}",
                        include="placement")
     return fbf.related(document.resource, "placement",
                        included=document.included)

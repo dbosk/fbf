@@ -1307,13 +1307,13 @@ The chapter that declares a type knows how to find it, so it also registers
 a function that fetches an example, in a chunk [[<<example fetchers>>]]:
 \begin{verbatim}
 @example("lti/placement")
-def placement_of_the_launched_activity(fbf, launched):
+def placement_of_the_launched_activity(fbf, login):
     ...
     return placement
 \end{verbatim}
-A fetcher gets the test's [[FBF]] client and the [[FBFLogin]] of the launch,
-whose [[course_uuid]] and [[activity_uuid]] say where to start looking, and
-returns one resource.
+A fetcher gets the test's [[FBF]] client and, as [[login]], the
+[[FBFLogin]] of the launch, whose [[course_uuid]] and [[activity_uuid]]
+say where to start looking, and returns one resource.
 It runs in a service test, so its requests are recorded and replayed like
 any other.
 
@@ -1342,9 +1342,9 @@ The chunk starts empty here; the chapters add their fetchers.
 <<test functions>>=
 def test_example_refuses_a_second_fetcher_for_a_type(monkeypatch):
   monkeypatch.setattr(conftest, "EXAMPLES", {})
-  conftest.example("test-type")(lambda fbf, launched: None)
+  conftest.example("test-type")(lambda fbf, login: None)
   with pytest.raises(ValueError, match="test-type"):
-    conftest.example("test-type")(lambda fbf, launched: None)
+    conftest.example("test-type")(lambda fbf, login: None)
 @
 
 

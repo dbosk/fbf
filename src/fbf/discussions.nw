@@ -617,12 +617,12 @@ chapter's subject.
 from fbf import discussions as discussion
 
 
-def discussion_materials(fbf, launched):
+def discussion_materials(fbf, login):
     """Yield `(document, material)` from the launched activity, then course."""
     others = [activity["id"] for activity in
-              fbf.get(f"v1/courses/{launched.course_uuid}/activities")
-              .resources if activity["id"] != launched.activity_uuid]
-    for activity in [launched.activity_uuid] + others:
+              fbf.get(f"v1/courses/{login.course_uuid}/activities")
+              .resources if activity["id"] != login.activity_uuid]
+    for activity in [login.activity_uuid] + others:
         document = fbf.get(f"v1/activities/{activity}",
                            include="tasks.material")
         for (kind, _), material in document.included.items():
@@ -630,9 +630,9 @@ def discussion_materials(fbf, launched):
                 yield document, material
 
 
-def discussion_example(fbf, launched, kind, resources_of):
+def discussion_example(fbf, login, kind, resources_of):
     """Return the first resource of `kind` among `resources_of` a material."""
-    for document, material in discussion_materials(fbf, launched):
+    for document, material in discussion_materials(fbf, login):
         for resource in resources_of(fbf, document, material):
             if resource["type"] == kind:
                 return resource
@@ -659,26 +659,26 @@ def discussion_choices(fbf, document, material):
 
 
 @example("activities")
-def launched_activity(fbf, launched):
-    return fbf.get(f"v1/activities/{launched.activity_uuid}").resource
+def launched_activity(fbf, login):
+    return fbf.get(f"v1/activities/{login.activity_uuid}").resource
 
 
 @example("users")
-def current_user(fbf, launched):
+def current_user(fbf, login):
     return fbf.get("v1/users/current").resource
 
 
 @example("multimedia-tasks")
-def multimedia_task(fbf, launched):
+def multimedia_task(fbf, login):
     return discussion_example(
-        fbf, launched, "multimedia-tasks",
+        fbf, login, "multimedia-tasks",
         lambda fbf, document, material: document.included.values())
 
 
 @example("multimedia/material")
-def material(fbf, launched):
+def material(fbf, login):
     return discussion_example(
-        fbf, launched, "multimedia/material",
+        fbf, login, "multimedia/material",
         lambda fbf, document, material: [material])
 
 
@@ -689,18 +689,18 @@ for kind, relationship in [("comments", "comments"),
                            ("open-questions", "questions"),
                            ("multiple-choice-questions", "questions"),
                            ("scratch-off-questions", "questions")]:
-    example(kind)(lambda fbf, launched, kind=kind, name=relationship:
-                  discussion_example(fbf, launched, kind,
+    example(kind)(lambda fbf, login, kind=kind, name=relationship:
+                  discussion_example(fbf, login, kind,
                                      discussion_list(name)))
 
 for kind in ["open-answers", "multiple-choice-answers",
              "scratch-off-answers"]:
-    example(kind)(lambda fbf, launched, kind=kind:
-                  discussion_example(fbf, launched, kind,
+    example(kind)(lambda fbf, login, kind=kind:
+                  discussion_example(fbf, login, kind,
                                      discussion_answers))
 
 example("questions/choice")(
-    lambda fbf, launched: discussion_example(fbf, launched,
+    lambda fbf, login: discussion_example(fbf, login,
                                              "questions/choice",
                                              discussion_choices))
 @
