@@ -8,6 +8,7 @@ SHELL=		/bin/bash
 .DELETE_ON_ERROR:
 
 MODULES+=	init.nw
+MODULES+=	launch.nw
 
 .PHONY: all
 all: __init__.py ${MODULES:.nw=.tex}

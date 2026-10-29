@@ -1,0 +1,436 @@
+\chapter{From a Canvas API token to FeedbackFruits}
+\label{Launch}
+
+This chapter gets us an FBF access token, starting from nothing but the
+Canvas API token that [[canvaslms]] already stores.
+
+\section{The problem: FBF trusts only Canvas}
+
+FBF has no login for KTH users.
+A user reaches FBF by opening an FBF assignment in Canvas, and the browser
+then runs an LTI~1.3 launch, which is an OpenID Connect login where Canvas is
+the identity provider.
+A browser capture (HAR file) of opening such an assignment shows three hops.
+\begin{description}
+\item[Hop 1, the Canvas page.] The assignment page contains a hidden form,
+  the \emph{tool form}, which the page submits automatically.
+  It POSTs [[iss]], [[login_hint]], [[client_id]], [[lti_message_hint]] and a
+  few more fields to FBF's [[/v1/lti/login]].
+\item[Hop 2, the OIDC login.] FBF answers with redirects back to Canvas's
+  [[/api/lti/authorize]].
+  Canvas checks that a logged-in user matching [[login_hint]] is present and
+  returns a second auto-submitting form, carrying the signed [[id_token]].
+\item[Hop 3, the launch.] That form POSTs to FBF's [[/v1/lti/launch]].
+  FBF verifies the token and redirects to the activity, setting two cookies:
+  [[access_token]], a JWT valid for 30~minutes, and [[refresh_token]], valid
+  for 14~days.
+  The activity page is FBF's web app, which calls the API at the
+  [[api-url]] given in a [[<meta>]] tag.
+\end{description}
+
+Nothing in this chain is secret ahead of time: the [[id_token]] exists only
+once a logged-in Canvas session asks for it in hop~2.
+That is why an earlier attempt failed, which tried to exchange the static
+[[code]] in the assignment's launch URL for a token directly.
+What we need is a Canvas \emph{session}, not a token to exchange.
+
+\section{The solution: a sessionless launch}
+
+Canvas offers a way to get that session from an API token.
+The endpoint
+\begin{center}
+[[GET /api/v1/courses/:course_id/external_tools/sessionless_launch]]
+\end{center}
+with [[launch_type=assessment]] and an [[assignment_id]] returns a URL.
+For an LTI~1.3 tool, Canvas adds a [[session_token]] parameter to the URL
+unless the API token's developer key requires scopes.
+(See [[generate_session_token]] in Canvas's
+[[lti/concerns/sessionless_launches.rb]].)
+Tokens that a user generates in their Canvas settings belong to Canvas's
+default developer key, which does not require scopes, so they get one.
+The first GET of the URL turns the [[session_token]] into a
+[[canvas_session]] cookie, and from then on a [[requests.Session]] can play
+the browser's part through all four hops.
+
+Each hop below is a function of its own that checks what it expects to see:
+a status, a form with certain fields, a cookie.
+When FBF or Canvas changes something, the [[LaunchError]] it raises names the
+hop and the expectation that failed, which is where the HAR tools of
+\cref{HAR} take over.
+
+<<[[launch.py]]>>=
+"""Launch FeedbackFruits from Canvas to obtain an FBF access token."""
+
+<<imports>>
+
+<<constants>>
+
+<<classes>>
+
+<<functions>>
+@
+
+The tests import everything from the module.
+
+<<test [[launch.py]]>>=
+from fbf.launch import *
+
+<<test functions>>
+@
+
+
+\section{Errors that name the hop}
+
+A launch fails in a different place depending on what changed.
+A message like [[KeyError: 'id_token']] would leave us guessing, so every
+check raises a [[LaunchError]] that carries the number and name of the hop.
+The number ties the error to the list above and to the hops that
+[[fbf har-shape]] prints.
+
+<<classes>>=
+class LaunchError(Exception):
+    """A hop of the LTI launch did not look as expected.
+
+    `hop` is the hop number (0--3) and `step` its name, so that the message
+    says where the launch broke.
+    """
+
+    def __init__(self, hop, step, message):
+        self.hop = hop
+        self.step = step
+        super().__init__(f"hop {hop} ({step}): {message}")
+@
+
+Let's verify that the message carries the hop.
+
+<<test functions>>=
+def test_launch_error_names_hop():
+  error = LaunchError(3, "FBF launch", "no access_token cookie")
+  assert str(error) == "hop 3 (FBF launch): no access_token cookie"
+  assert error.hop == 3
+@
+
+
+\section{Reading forms and meta tags}
+
+Two hops hand us an HTML page with a form to submit, and the last one a page
+whose [[<meta>]] tags name the API.
+We need only the [[<form>]], [[<input>]] and [[<meta>]] elements, never the
+layout, so the standard library's [[html.parser]] is enough.
+It also tolerates the sloppy HTML of real pages, and it spares us the
+[[lxml]] dependency.
+
+A [[Form]] holds what a browser would submit: the action URL, the method and
+the named inputs with their values.
+Inputs outside any form are ignored, as a browser ignores them on submit.
+
+<<imports>>=
+import dataclasses
+import html.parser
+@
+
+<<classes>>=
+@dataclasses.dataclass
+class Form:
+    """An HTML form as a browser would submit it."""
+
+    action: str
+    method: str = "get"
+    fields: dict = dataclasses.field(default_factory=dict)
+
+
+class PageParser(html.parser.HTMLParser):
+    """Collect the forms and the named meta tags of an HTML page."""
+
+    def __init__(self):
+        super().__init__()
+        self.forms = []
+        self.meta = {}
+
+    def handle_starttag(self, tag, attrs):
+        attrs = dict(attrs)
+        if tag == "form":
+            self.forms.append(Form(
+                action=attrs.get("action") or "",
+                method=(attrs.get("method") or "get").lower()))
+        elif tag == "input" and self.forms and attrs.get("name"):
+            self.forms[-1].fields[attrs["name"]] = attrs.get("value") or ""
+        elif tag == "meta" and attrs.get("name"):
+            self.meta[attrs["name"]] = attrs.get("content")
+@
+
+The hops call these two helpers rather than the parser.
+
+<<functions>>=
+def parse_page(text):
+    """Return the `PageParser` holding the forms and meta tags of `text`."""
+    parser = PageParser()
+    parser.feed(text)
+    return parser
+
+
+def find_form(forms, predicate):
+    """Return the first form in `forms` for which `predicate` is true."""
+    return next((form for form in forms if predicate(form)), None)
+@
+
+Let's verify the parser on a page shaped like Canvas's assignment page: a
+hidden tool form with hidden inputs, next to an unrelated search form.
+The values are made up.
+
+<<test functions>>=
+TOOL_PAGE = """
+<form action="/search"><input name="q" value=""></form>
+<div class="tool_content_wrapper">
+  <form action="https://api.example.com/v1/lti/login" class="hide"
+        method="POST" target="tool_content_1" id="tool_form_1">
+    <input type="hidden" name="iss" value="https://canvas.instructure.com" />
+    <input type="hidden" name="login_hint" value="abc123" />
+    <input type="hidden" name="lti_message_hint" value="x.y.z" />
+    <button class="btn" type="submit">Load</button>
+  </form>
+</div>
+<meta name="csrf-token" content="t0k3n">
+"""
+
+def test_parse_page_finds_tool_form():
+  page = parse_page(TOOL_PAGE)
+  form = find_form(page.forms, lambda f: f.action.endswith("/lti/login"))
+  assert form.method == "post"
+  assert form.fields == {"iss": "https://canvas.instructure.com",
+                         "login_hint": "abc123",
+                         "lti_message_hint": "x.y.z"}
+  assert page.meta["csrf-token"] == "t0k3n"
+
+def test_find_form_returns_none_without_match():
+  assert find_form(parse_page(TOOL_PAGE).forms,
+                   lambda f: "id_token" in f.fields) is None
+@
+
+
+\section{Hop 0: the sessionless launch URL}
+
+Asking Canvas for the URL is a plain API call with the Canvas token.
+We call it hop~0, since the browser never makes it: it only replaces the
+user's click on the assignment.
+We check for the [[session_token]] parameter because without it the launch
+would fail two hops later with a [[login_required]] error from Canvas,
+far from the cause: the developer key of the token requires scopes.
+
+<<imports>>=
+import urllib.parse
+import requests
+@
+
+<<functions>>=
+def sessionless_launch_url(canvas_url, canvas_token,
+                           course_id, assignment_id, session=None):
+    """Return Canvas's sessionless launch URL for an FBF assignment.
+
+    `canvas_url` is the Canvas base URL, e.g. `https://canvas.kth.se`.
+    """
+    session = session or requests.Session()
+    response = session.get(
+        f"{canvas_url}/api/v1/courses/{course_id}"
+        "/external_tools/sessionless_launch",
+        params={"launch_type": "assessment", "assignment_id": assignment_id},
+        headers={"Authorization": f"Bearer {canvas_token}"})
+    if response.status_code != 200:
+        raise LaunchError(0, "sessionless launch",
+                          f"Canvas answered {response.status_code}")
+    url = response.json().get("url")
+    if not url:
+        raise LaunchError(0, "sessionless launch", "no url in the response")
+    if "session_token" not in urllib.parse.parse_qs(
+            urllib.parse.urlsplit(url).query):
+        raise LaunchError(
+            0, "sessionless launch",
+            "the URL has no session_token; does the Canvas token's "
+            "developer key require scopes?")
+    return url
+@
+
+
+\section{Hop 1: the tool form on the Canvas page}
+
+Following the URL logs the session in and lands on the assignment page.
+One detail is easy to miss: Canvas answers [[400 endpoint does not support
+*/*]] when the request accepts anything, which is what [[requests]] sends by
+default.
+A browser asks for HTML first, and so must we.
+We set the header on the session, so that the redirects after the FBF
+hops ask for HTML too.
+
+<<constants>>=
+HTML_ACCEPT = ("text/html,application/xhtml+xml,application/xml;q=0.9,"
+               "*/*;q=0.8")
+@
+
+The tool form is the one whose action is FBF's OIDC login endpoint.
+
+<<functions>>=
+def open_tool_page(session, launch_url):
+    """Follow `launch_url` and return the tool form on the Canvas page."""
+    session.headers["Accept"] = HTML_ACCEPT
+    response = session.get(launch_url)
+    if response.status_code != 200:
+        raise LaunchError(1, "Canvas tool page",
+                          f"Canvas answered {response.status_code}")
+    form = find_form(parse_page(response.text).forms,
+                     lambda f: f.action.endswith("/lti/login"))
+    if not form:
+        raise LaunchError(1, "Canvas tool page",
+                          "no form posting to .../lti/login")
+    return form
+@
+
+
+\section{Hop 2: the OIDC login}
+
+Submitting the tool form starts the OpenID Connect login.
+FBF moves the POST to its regional host with a [[307]], which [[requests]]
+follows with the body intact, and then redirects to Canvas's
+[[/api/lti/authorize]].
+Canvas answers with the form that carries the [[id_token]].
+
+When Canvas refuses, it still answers [[200]] with a form, one that carries
+[[error]] and [[error_description]] fields for the tool.
+We report those, since they say what Canvas objected to; [[login_required]]
+means that the session from hop~1 did not take.
+
+<<functions>>=
+def initiate_login(session, tool_form):
+    """Submit the tool form; return Canvas's form carrying the `id_token`."""
+    response = session.post(tool_form.action, data=tool_form.fields)
+    if response.status_code != 200:
+        raise LaunchError(2, "OIDC login",
+                          f"answered {response.status_code}")
+    forms = parse_page(response.text).forms
+    refusal = find_form(forms, lambda f: "error" in f.fields)
+    if refusal:
+        raise LaunchError(2, "OIDC login",
+                          f"Canvas refused: {refusal.fields['error']}: "
+                          f"{refusal.fields.get('error_description', '')}")
+    form = find_form(forms, lambda f: "id_token" in f.fields)
+    if not form:
+        raise LaunchError(2, "OIDC login", "no form with an id_token")
+    return form
+@
+
+
+\section{Hop 3: the launch and the tokens}
+
+Submitting the [[id_token]] completes the launch.
+FBF sets its tokens as cookies on its regional domain and redirects to the
+activity in its web app.
+We return the tokens rather than the cookie jar: the API accepts the access
+token as an ordinary [[Authorization: Bearer]] header, so the API client
+needs neither the cookies nor the web app's CSRF token.
+
+<<constants>>=
+ACCESS_COOKIE = "access_token"
+REFRESH_COOKIE = "refresh_token"
+@
+
+The cookies live on a domain such as [[.eu.feedbackfruits.com]].
+We look them up by name only, so that FBF can move us to another region
+without breaking this code.
+
+<<functions>>=
+def find_cookie(jar, name):
+    """Return the value of the cookie `name` in `jar`, on any domain."""
+    return next((cookie.value for cookie in jar if cookie.name == name), None)
+@
+
+The redirect target names the FBF course and the activity, both as UUIDs,
+for example
+[[/courses/lti%2Fcourse/<course>/activities/<activity>]].
+They are handy for the caller, who launched exactly this activity.
+
+<<imports>>=
+import re
+@
+
+<<constants>>=
+UUID = r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
+ACTIVITY_PATH = re.compile(
+    rf"/courses/.*?(?P<course>{UUID})/activities/(?P<activity>{UUID})")
+<<functions>>=
+def activity_from_url(url):
+    """Return `(course_uuid, activity_uuid)` from an FBF activity URL."""
+    match = ACTIVITY_PATH.search(urllib.parse.unquote(url))
+    return (match["course"], match["activity"]) if match else (None, None)
+@
+
+<<test functions>>=
+def test_activity_from_url():
+  course = "b4468b1b-0000-4000-8000-000000000001"
+  activity = "340a516d-0000-4000-8000-000000000002"
+  url = (f"https://eu.example.com/courses/lti%2Fcourse/{course}"
+         f"/activities/{activity}?embed=default")
+  assert activity_from_url(url) == (course, activity)
+  assert activity_from_url("https://eu.example.com/") == (None, None)
+@
+
+The page we land on tells us where the API is, in [[<meta name="api-url">]].
+Should FBF drop that tag, we fall back on the host that handled the launch
+POST, which today is the API host itself.
+The API's location is not worth failing the launch over, since we can still
+find it.
+
+<<classes>>=
+@dataclasses.dataclass
+class FBFLogin:
+    """The result of a launch: FBF tokens and where to use them."""
+
+    access_token: str
+    refresh_token: str
+    api_url: str
+    course_uuid: str = None
+    activity_uuid: str = None
+<<functions>>=
+def complete_launch(session, id_token_form):
+    """Submit the `id_token` form and return the resulting `FBFLogin`."""
+    response = session.post(id_token_form.action, data=id_token_form.fields)
+    if response.status_code != 200:
+        raise LaunchError(3, "FBF launch",
+                          f"answered {response.status_code}")
+    access_token = find_cookie(session.cookies, ACCESS_COOKIE)
+    if not access_token:
+        raise LaunchError(3, "FBF launch", f"no {ACCESS_COOKIE} cookie")
+    api_url = parse_page(response.text).meta.get("api-url")
+    if not api_url:
+        launch_hop = (response.history or [response])[-1]
+        parts = urllib.parse.urlsplit(launch_hop.url)
+        api_url = f"{parts.scheme}://{parts.netloc}"
+    return FBFLogin(access_token,
+                    find_cookie(session.cookies, REFRESH_COOKIE),
+                    api_url.rstrip("/"),
+                    *activity_from_url(response.url))
+@
+
+
+\section{The whole launch}
+
+Put together, a launch is hop~0 and the three hops in a row on one session,
+which carries the cookies from one hop to the next.
+Callers may pass a session of their own, for instance one that records the
+traffic.
+
+<<functions>>=
+def launch(canvas_url, canvas_token, course_id, assignment_id, session=None):
+    """Launch an FBF assignment from Canvas and return an `FBFLogin`.
+
+    `course_id` and `assignment_id` are Canvas IDs of an assignment that
+    launches FeedbackFruits.  Raises `LaunchError` naming the hop that failed.
+    """
+    session = session or requests.Session()
+    url = sessionless_launch_url(canvas_url, canvas_token,
+                                 course_id, assignment_id, session)
+    tool_form = open_tool_page(session, url)
+    id_token_form = initiate_login(session, tool_form)
+    return complete_launch(session, id_token_form)
+@
+
+The hops need Canvas and FBF to run, so the tests that cover them replay
+recorded traffic; see the testing chapter.
