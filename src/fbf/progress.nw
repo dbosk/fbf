@@ -567,8 +567,9 @@ def progress_row(assignment, resource, tasks, sent, student, scores):
 @
 
 Let's verify with three students: one with a published grade, one whose
-grade FBF has not sent, and one without progress; and a teacher, who has
-progress but is not a student.
+grade FBF has not sent (an actor of type [[people]], which must make no
+difference), and one without progress; and a teacher, who has progress but
+is not a student.
 
 <<test functions>>=
 ASSIGNMENT = CanvasAssignment(None, {"id": 7, "name": "Week 1",
@@ -579,7 +580,7 @@ SENT = {"g1": {"type": "lti/grade", "id": "g1",
 def test_assemble_joins_fbf_and_canvas():
   progresses = [progress("a1", published="2026-10-01", grade="g1"),
                 progress("a2", overall=40.0,
-                         grades={"t1": {"viewed": 40}}),
+                         grades={"t1": {"viewed": 40}}, kind="people"),
                 progress("teacher")]
   student_of = {"a1": STUDENTS[0], "a2": STUDENTS[1]}
   rows = assemble(ASSIGNMENT, [VIDEO, REFLECT], progresses, SENT,
