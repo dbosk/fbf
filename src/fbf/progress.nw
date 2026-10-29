@@ -720,15 +720,21 @@ def test_progress_rows_short_and_long():
   assert list(progress_rows([empty])) == [
     ["Week 1", "cy@example.com", "", "", "", "no", "", ""]]
   assert list(progress_rows([empty], long=True)) == []
+  assert [r[1] for r in progress_rows([row, empty])] \
+    == ["ada@example.com", "cy@example.com"]
+  assert len(list(progress_rows([row, empty, row], long=True))) == 8
 @
 
 A counting facet whose count we do not know shows no count, rather than a
-count of nothing.
+count of nothing; and a count without an amount, such as a boolean facet
+might get, shows none either, since there is nothing to count towards.
 
 <<test functions>>=
 def test_facet_text_shows_only_known_counts():
   assert facet_text(Facet("multimedia", 1, "comments", 0, 30.0, None, 3)) \
     == "comments 0/30"
+  assert facet_text(Facet("multimedia", 1, "viewed", 40, 40.0, 1, None)) \
+    == "viewed 40/40"
 @
 
 \subsection{Selecting students}
