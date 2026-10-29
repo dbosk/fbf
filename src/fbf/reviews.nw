@@ -1,0 +1,1130 @@
+\chapter{Peer reviews}
+\label{Reviews}
+
+In FBF's peer-feedback activities students submit their work, review the
+work of a few peers, rate the reviews they got, and reflect on the whole.
+Canvas sees none of it, only the grade that FBF computes in the end.
+The [[reviews]] command lists what the students wrote: by default the
+reviews, one row per reviewer, reviewee and criterion; with [[--feedback]]
+the reviewees' ratings of the reviews they got; with [[--reflections]] the
+reflections.
+
+\section{How FBF stores a peer review}
+
+We learned the structure by following the API's relationships from a
+peer-feedback activity; \cref{review-model} shows what we found.
+\begin{description}
+\item[Activity and tasks.] A peer-feedback activity has six tasks, one per
+  step of the students' work: instructions, submission, review, viewing the
+  reviews received, reflection and a grade.
+  Three of them matter here.
+  The [[submission-review-tasks]] resource has the [[criteria]] and the
+  [[allocations]].
+  The [[submission-review-view-tasks]] resource says whether the
+  reviewees may rate the reviews they got
+  ([[reviewer-feedback-enabled]]).
+  The [[reflect-tasks]] resource has the [[reflections]].
+\item[Allocations.] An allocation ([[assignments/allocation]]) pairs one
+  reviewer, its [[actor]], with one reviewee, its [[allocable]].
+  Both are users in every activity we have seen; the task's
+  [[actor-type]] and [[allocable-type]] suggest that groups are possible
+  too.
+  Everything the reviewer wrote hangs off the allocation, as [[reviews]] and
+  [[ratings]], and the reviewee's opinion of it as [[reviewer-feedback]].
+  The attributes [[reviews-count]] and [[ratings-count]] say how many there
+  are, which saves a request per empty list.
+\item[Criteria.] A criterion is either a comment criterion
+  ([[assignments/criterion]]), which asks for text only, or a rubric
+  criterion ([[assignments/rubric-criterion]]), whose [[options]] are the
+  levels to choose from ([[assignments/criterion-option]], each with a
+  [[title]] and a [[weight]]).
+  Criteria have an [[order]], which is the order of the review form.
+\item[Reviews and ratings.] What FBF calls a review ([[reviews]]) is a
+  comment on one criterion; there may be several per criterion, and rubric
+  criteria get comments too.
+  Its [[parent]] tells whether it is about the work as a whole (the
+  activity) or about a submitted file ([[assignments/submission]]).
+  A rating ([[ratings]]) is the level chosen on a rubric criterion, the
+  [[option]]; it has no value of its own, so a score is the option's
+  [[weight]].
+\item[Feedback and reflections.] A reviewer feedback
+  ([[reviewer-feedbacks]]) has a [[rating]], a number, and a [[body]].
+  A reflection ([[reflections]]) has a [[user]] and a [[body]].
+\end{description}
+
+\begin{figure}
+\centering
+\begin{verbatim}
+activity --tasks--> submission-review-tasks,
+                    submission-review-view-tasks,
+                    reflect-tasks, ...
+submission-review-tasks --criteria--> (rubric-)criterion
+(rubric-)criterion --options--> criterion-option
+submission-review-tasks --allocations--> allocation
+allocation: actor = reviewer, allocable = reviewee
+allocation --reviews--> reviews: criterion,
+                        parent = activity | submission
+allocation --ratings--> ratings: criterion, option
+allocation --reviewer-feedback--> reviewer-feedbacks
+reflect-tasks --reflections--> reflections: user
+\end{verbatim}
+\caption{The resources of a peer review and their relationships.}
+\label{review-model}
+\end{figure}
+
+<<required names>>=
+requires("activities", relationships=["tasks"])
+requires("submission-review-tasks", relationships=["criteria", "allocations"])
+requires("submission-review-view-tasks",
+         attributes=["reviewer-feedback-enabled"])
+requires("reflect-tasks", relationships=["reflections"])
+requires("assignments/allocation",
+         attributes=["reviews-count", "ratings-count"],
+         relationships=["actor", "allocable", "reviews", "ratings",
+                        "reviewer-feedback"])
+for kind in ["assignments/criterion", "assignments/rubric-criterion"]:
+    requires(kind, attributes=["title", "order"], relationships=["options"])
+requires("assignments/criterion-option", attributes=["title", "weight"])
+requires("reviews", attributes=["body", "created-at"],
+         relationships=["allocation", "criterion", "parent"])
+requires("ratings", attributes=["created-at"],
+         relationships=["allocation", "criterion", "option"])
+requires("reviewer-feedbacks", attributes=["body", "rating"],
+         relationships=["allocation"])
+requires("reflections", attributes=["body"], relationships=["user"])
+requires("users", attributes=["name"])
+@
+
+Several quirks of this part of the API shaped the code.
+\begin{description}
+\item[No includes.] FBF silently ignores [[include=]] on all the
+  [[v1/assignments/...]] lists, and the relationships between the review
+  resources are bare references without links.
+  So we fetch each kind of resource as a list of its own and join them by
+  id ourselves, as the discussions do with annotations
+  (\cref{Discussions}).
+\item[No bulk lists.] There is no list of all reviews of a task.
+  The reviews and ratings come one list per allocation, some 800 requests
+  for an activity of 270 allocations; we send them in parallel with
+  [[get_many]] (\cref{Parallel}), and only for allocations whose counts are
+  not zero.
+  Two endpoints look like shortcuts but must not be used:
+  [[v1/assignments/reviews]] with a filter never answers, and
+  [[v1/assignments/ratings]] ignores its filters and returns ratings from
+  other courses too.
+  Nor do the reviews of a submission do: they miss the reviews of the work
+  as a whole, whose parent is the activity.
+\item[Levels by id.] The options of the rubric criteria are fetched by id
+  in one request,
+  \begin{center}
+  [[v1/assignments/criterion_options?filter[id]=...]],
+  \end{center}
+  since a filter by criterion is refused.
+\item[Rich text.] Reviews and reviewer feedback have plain text bodies, but
+  a reflection's body is a Quill Delta, the document format of the editor
+  that the students write it in.
+\end{description}
+
+The module separates fetching from assembling, as the discussions do.
+Fetching follows the relationships above and returns resources; assembling
+joins them into reviews without touching the network, which is where the
+decisions are and where tests reach them with resources shaped like FBF's.
+
+<<[[reviews.py]]>>=
+"""List the peer reviews of FeedbackFruits peer-feedback activities."""
+
+<<imports>>
+
+<<constants>>
+
+<<classes>>
+
+<<functions>>
+@
+
+<<test [[reviews.py]]>>=
+import pytest
+
+from fbf.reviews import *
+
+<<test functions>>
+@
+
+
+\section{Reviews, feedback and reflections}
+
+A row of the default output is a reviewer's assessment of one reviewee on
+one criterion: the level chosen, if the criterion is a rubric, and the
+comments written.
+FBF keeps the level and the comments apart, as a rating and as reviews, but
+a reader wants them together, so a [[Review]] holds both.
+It names the people rather than holding their ids, since the names are what
+the output shows.
+A [[Comment]] keeps what it is about ([[on]]: the activity as a whole or a
+submitted file) and when it was written.
+
+<<imports>>=
+import dataclasses
+<<classes>>=
+@dataclasses.dataclass
+class Comment:
+    """A reviewer's comment on one criterion."""
+
+    on: str
+    created: str
+    body: str
+
+
+@dataclasses.dataclass
+class Review:
+    """A reviewer's level and comments on one criterion for a reviewee."""
+
+    activity: str
+    reviewee: str
+    reviewer: str
+    criterion: str
+    level: str = ""
+    score: int = None
+    comments: list = dataclasses.field(default_factory=list)
+@
+
+The reviewee's opinion of a review and a student's reflection are simpler,
+and their fields are the columns of their views.
+
+<<classes>>=
+@dataclasses.dataclass
+class Feedback:
+    """A reviewee's rating of the review that a reviewer gave."""
+
+    activity: str
+    reviewee: str
+    reviewer: str
+    rating: int
+    body: str
+
+
+@dataclasses.dataclass
+class Reflection:
+    """A student's reflection on a peer-feedback activity."""
+
+    activity: str
+    student: str
+    body: str
+@
+
+
+\section{What we do not know}
+
+The activities we explored had users as reviewers and reviewees, and
+comment and rubric criteria only.
+FBF has more: the task's [[actor-type]] and [[allocable-type]] suggest
+group reviews, and the editor offers scale criteria.
+We do not know how their data look, and guessing could print wrong rows
+that look right: a group's id taken for a user's, a scale value taken for a
+level.
+So the code checks the types it relies on and raises
+[[UnknownTypeError]], naming the type, for anything else.
+It is a [[LookupError]], so the command line reports its message rather
+than a traceback (\cref{CLI}).
+
+<<classes>>=
+class UnknownTypeError(LookupError):
+    """FBF data of a type that fbf does not know how to read."""
+<<constants>>=
+CRITERION_TYPES = ["assignments/criterion", "assignments/rubric-criterion"]
+PERSON_TYPE = "users"
+@
+
+A reviewer or reviewee is the related id of the allocation's [[actor]] or
+[[allocable]], once we know that it is a user.
+
+<<functions>>=
+def person(allocation, name):
+    """Return the user id of the `actor` or `allocable` of `allocation`."""
+    data = relationship(allocation, name).get("data") or {}
+    if data.get("type") != PERSON_TYPE:
+        raise UnknownTypeError(
+            f"allocation {name} of type {data.get('type')!r}: only "
+            "reviews between users are supported")
+    return data["id"]
+
+
+def check_criteria(criteria):
+    """Raise `UnknownTypeError` for criteria of a type we cannot read."""
+    for criterion in criteria:
+        if criterion["type"] not in CRITERION_TYPES:
+            raise UnknownTypeError(
+                f"criterion of type {criterion['type']!r}: only comment "
+                "and rubric criteria are supported")
+<<imports>>=
+from fbf.schema import attribute, related_id, relationship, requires
+@
+
+The resources in the tests are shaped like FBF's, with the attribute and
+relationship names we found, and made-up values.
+The helper [[ref]] makes the bare references that FBF uses between them.
+
+<<test functions>>=
+def ref(kind, id):
+  return {"data": {"type": kind, "id": id}}
+
+def allocation(id, reviewer="u1", reviewee="u2", reviews=1, ratings=1,
+               actor_type="users"):
+  return {"type": "assignments/allocation", "id": id,
+          "attributes": {"reviews-count": reviews, "ratings-count": ratings},
+          "relationships": {"actor": ref(actor_type, reviewer),
+                            "allocable": ref("users", reviewee),
+                            "reviews": {"links": {"related": f"/r/{id}"}},
+                            "ratings": {"links": {"related": f"/s/{id}"}},
+                            "reviewer-feedback": {
+                              "links": {"related": f"/f/{id}"}}}}
+
+def test_person_reads_users_and_refuses_groups():
+  assert person(allocation("a"), "actor") == "u1"
+  assert person(allocation("a"), "allocable") == "u2"
+  with pytest.raises(UnknownTypeError, match="'groups'"):
+    person(allocation("a", actor_type="groups"), "actor")
+
+def test_check_criteria_refuses_unknown_types():
+  check_criteria([{"type": "assignments/criterion"},
+                  {"type": "assignments/rubric-criterion"}])
+  with pytest.raises(UnknownTypeError, match="scale-criterion"):
+    check_criteria([{"type": "assignments/scale-criterion"}])
+@
+
+
+\section{The text of a body}
+
+Reviews and reviewer feedback have bodies that are strings.
+A reflection's body is a Quill Delta: a dictionary whose [[ops]] list the
+pieces of the text in order.
+A piece's [[insert]] is either a string, possibly with formatting
+[[attributes]] that we drop, or an embedded object.
+The only embed we have seen is an emoji, whose [[unicode]] is the code
+point in hexadecimal, or several joined by hyphens for composed emoji; we
+turn it into the character.
+Other embeds, an image say, we show as their name in brackets, so that the
+reader sees that something was there.
+We read the Delta rather than FBF's rendering of it ([[body-rendered]]),
+which is HTML and would need its tags removed.
+A body we cannot read is an error, for the reasons above.
+
+<<functions>>=
+def plain_text(body):
+    """Return the text of a `body`: a string or a Quill Delta."""
+    if body is None:
+        return ""
+    if isinstance(body, str):
+        return body
+    if isinstance(body, dict) and isinstance(body.get("ops"), list):
+        return "".join(insert_text(op.get("insert")) for op in body["ops"])
+    raise UnknownTypeError(f"body of unknown format {type(body).__name__}")
+
+
+def insert_text(insert):
+    """Return the text of one Quill Delta `insert`."""
+    if isinstance(insert, str):
+        return insert
+    if not isinstance(insert, dict):
+        return ""
+    if "emoji" in insert:
+        return emoji(insert["emoji"])
+    return "".join(f"[{name}]" for name in insert)
+
+
+def emoji(embed):
+    """Return the character of a Quill emoji `embed`, or `:name:`."""
+    try:
+        return "".join(chr(int(code, 16))
+                       for code in embed["unicode"].split("-"))
+    except (KeyError, ValueError, AttributeError):
+        return f":{embed.get('name', '')}:"
+@
+
+<<test functions>>=
+def test_plain_text_of_strings_and_deltas():
+  assert plain_text("Good work") == "Good work"
+  assert plain_text(None) == ""
+  delta = {"ops": [{"insert": "Bold", "attributes": {"bold": True}},
+                   {"insert": " move "},
+                   {"insert": {"emoji": {"name": "thumbsup",
+                                         "unicode": "1f44d"}}},
+                   {"insert": {"image": "https://example.com/x.png"}},
+                   {"insert": "\n"}]}
+  assert plain_text(delta) == "Bold move \U0001F44D[image]\n"
+  with pytest.raises(UnknownTypeError):
+    plain_text({"html": "<p>x</p>"})
+
+def test_emoji_composed_and_unreadable():
+  assert emoji({"unicode": "1f44d-1f3fb"}) == "\U0001F44D\U0001F3FB"
+  assert emoji({"name": "smile", "unicode": "?"}) == ":smile:"
+@
+
+
+\section{Assembling the reviews}
+
+The reviews of an activity are assembled from five lists: the allocations,
+the reviews and ratings of all allocations, the criteria, and the options of
+the rubric criteria, plus the users.
+Reviews and ratings point to their allocation and criterion, so we group
+them by that pair, and each pair that has a rating or a comment becomes a
+[[Review]].
+Pairs with neither, the criteria a reviewer skipped or the allocations of a
+reviewer who never started, give no row: the output lists what was written,
+and an empty row per skipped criterion would drown it.
+
+We take the reviewer and reviewee from the allocation, not from the
+review's own [[user]]: a rating or a comment always belongs to an
+allocation, and the allocation names both parties.
+
+FBF has stored at most one rating per allocation and criterion in the
+activities we explored, as the review form allows one level per criterion.
+Should there be more, we keep the latest, which is the level the reviewer
+ended up with.
+
+<<functions>>=
+def make_reviews(activity, allocations, reviews, ratings, criteria,
+                 options, users):
+    """Return the `Review`s of an activity, assembled from its resources.
+
+    `reviews` and `ratings` are those of all `allocations`; `options` maps
+    option ids to the options of the rubric `criteria`, `users` user ids
+    to users.  The result is sorted by reviewee, reviewer and criterion.
+    """
+    check_criteria(criteria)
+    <<group comments and ratings by allocation and criterion>>
+    result = []
+    for allocation in allocations:
+        reviewer = name_of(users, person(allocation, "actor"))
+        reviewee = name_of(users, person(allocation, "allocable"))
+        for criterion in sorted(criteria,
+                                key=lambda c: attribute(c, "order")):
+            key = (allocation["id"], criterion["id"])
+            if key in comments or key in chosen:
+                <<add the [[Review]] of [[key]] to [[result]]>>
+    return sorted(result, key=lambda review: (review.reviewee,
+                                              review.reviewer))
+@
+
+Sorting the criteria by their order first and then the reviews by the people
+keeps the criteria in form order within each reviewer and reviewee, since
+Python's sort is stable.
+
+A comment's [[on]] says whether it is about the work or about a file;
+a parent of another type is shown by its type, so that it shows up rather
+than passing for one of the two.
+Comments are listed in the order they were written, and the latest rating
+wins, as discussed above.
+
+<<constants>>=
+PARENT_KINDS = {"activities": "activity",
+                "assignments/submission": "submission"}
+<<group comments and ratings by allocation and criterion>>=
+comments, chosen = {}, {}
+for review in sorted(reviews, key=lambda r: attribute(r, "created-at")):
+    key = (related_id(review, "allocation"), related_id(review, "criterion"))
+    comments.setdefault(key, []).append(make_comment(review))
+for rating in sorted(ratings, key=lambda r: attribute(r, "created-at")):
+    key = (related_id(rating, "allocation"), related_id(rating, "criterion"))
+    chosen[key] = related_id(rating, "option")
+@
+
+<<functions>>=
+def make_comment(review):
+    """Return the `Comment` of a review resource."""
+    parent = relationship(review, "parent").get("data") or {}
+    return Comment(on=PARENT_KINDS.get(parent.get("type"),
+                                       parent.get("type") or ""),
+                   created=attribute(review, "created-at"),
+                   body=plain_text(attribute(review, "body")))
+@
+
+The level and score come from the chosen option.
+The options are fetched by id, and an option that did not come back would
+leave the level empty; that would be a wrong row that looks right, so it
+is an error instead.
+
+<<add the [[Review]] of [[key]] to [[result]]>>=
+level, score = "", None
+if key in chosen:
+    option = options.get(chosen[key])
+    if option is None:
+        raise LookupError(f"criterion option {chosen[key]} not found")
+    level, score = attribute(option, "title"), attribute(option, "weight")
+result.append(Review(activity, reviewee, reviewer,
+                     attribute(criterion, "title"),
+                     level, score, comments.get(key, [])))
+@
+
+A user who has left the course may be missing from the users we get, and
+then the name is empty rather than the whole listing failing.
+
+<<functions>>=
+def name_of(users, id):
+    """Return the name of the user `id` in `users`, or an empty string."""
+    user = users.get(id)
+    return attribute(user, "name") if user else ""
+@
+
+Let's verify the assembly on a small activity: one rubric and one comment
+criterion, two allocations, and a third allocation without anything.
+
+<<test functions>>=
+def criterion(id, title, order, options=(), rubric=True):
+  kind = "assignments/rubric-criterion" if rubric else "assignments/criterion"
+  return {"type": kind, "id": id,
+          "attributes": {"title": title, "order": order},
+          "relationships": {"options": {"data": [
+            {"type": "assignments/criterion-option", "id": o}
+            for o in options]}}}
+
+def option(id, title, weight):
+  return {"type": "assignments/criterion-option", "id": id,
+          "attributes": {"title": title, "weight": weight}}
+
+def review(id, alloc, crit, body, created, parent="activities"):
+  return {"type": "reviews", "id": id,
+          "attributes": {"body": body, "created-at": created},
+          "relationships": {"allocation": ref("assignments/allocation", alloc),
+                            "criterion": ref("x", crit),
+                            "parent": ref(parent, "p")}}
+
+def rating(id, alloc, crit, opt, created="2026-10-01T10:00Z"):
+  return {"type": "ratings", "id": id,
+          "attributes": {"created-at": created},
+          "relationships": {"allocation": ref("assignments/allocation", alloc),
+                            "criterion": ref("x", crit),
+                            "option": ref("assignments/criterion-option",
+                                          opt)}}
+
+def user(id, name):
+  return {"type": "users", "id": id, "attributes": {"name": name}}
+
+CRITERIA = [criterion("c2", "Overall", 1, rubric=False),
+            criterion("c1", "Clarity", 0, options=["o0", "o1"])]
+OPTIONS = {"o0": option("o0", "Unclear", 0), "o1": option("o1", "Clear", 1)}
+USERS = {"u1": user("u1", "Bo"), "u2": user("u2", "Ada"),
+         "u3": user("u3", "Cy")}
+@
+
+Bo reviews Ada with a level and a comment on clarity and two comments
+overall; Cy reviews Ada with a level only; Ada reviews Cy but never started.
+The rows come sorted by reviewee, then reviewer, then criterion order,
+whatever the order of the input; the comments come in the order written.
+
+<<test functions>>=
+def test_make_reviews_joins_levels_and_comments():
+  allocations = [allocation("a1", "u1", "u2"), allocation("a2", "u3", "u2"),
+                 allocation("a3", "u2", "u3", reviews=0, ratings=0)]
+  reviews = [review("r2", "a1", "c2", "Later", "2026-10-02T10:00Z",
+                    parent="assignments/submission"),
+             review("r1", "a1", "c2", "First", "2026-10-01T10:00Z"),
+             review("r3", "a1", "c1", "Clear!", "2026-10-01T11:00Z")]
+  ratings = [rating("s1", "a1", "c1", "o1"), rating("s2", "a2", "c1", "o0")]
+  result = make_reviews("Essay", list(reversed(allocations)), reviews,
+                        ratings, CRITERIA, OPTIONS, USERS)
+  assert [(r.reviewee, r.reviewer, r.criterion, r.level, r.score,
+           [c.body for c in r.comments]) for r in result] == [
+    ("Ada", "Bo", "Clarity", "Clear", 1, ["Clear!"]),
+    ("Ada", "Bo", "Overall", "", None, ["First", "Later"]),
+    ("Ada", "Cy", "Clarity", "Unclear", 0, [])]
+  assert [c.on for c in result[1].comments] == ["activity", "submission"]
+  assert {r.activity for r in result} == {"Essay"}
+@
+
+The latest rating wins, and a rating whose option we lack is an error, not
+an empty level.
+
+<<test functions>>=
+def test_make_reviews_keeps_the_latest_rating():
+  ratings = [rating("s2", "a1", "c1", "o0", "2026-10-02T10:00Z"),
+             rating("s1", "a1", "c1", "o1", "2026-10-01T10:00Z")]
+  [result] = make_reviews("Essay", [allocation("a1")], [], ratings,
+                          CRITERIA, OPTIONS, USERS)
+  assert (result.level, result.score) == ("Unclear", 0)
+
+def test_make_reviews_refuses_missing_options_and_unknown_criteria():
+  with pytest.raises(LookupError, match="o9"):
+    make_reviews("Essay", [allocation("a1")], [],
+                 [rating("s1", "a1", "c1", "o9")], CRITERIA, OPTIONS, USERS)
+  scale = dict(criterion("c3", "Scale", 2), type="assignments/scale-criterion")
+  with pytest.raises(UnknownTypeError):
+    make_reviews("Essay", [], [], [], CRITERIA + [scale], OPTIONS, USERS)
+@
+
+
+\section{Fetching an activity's reviews}
+
+An activity's tasks are bare references, so we ask for them with
+[[include=tasks]] (see [[related]] in \cref{API}) and index them by type,
+which is unique among an activity's tasks.
+An activity without a review task is not a peer review; the command skips
+it.
+
+<<constants>>=
+REVIEW_TASK = "submission-review-tasks"
+VIEW_TASK = "submission-review-view-tasks"
+REFLECT_TASK = "reflect-tasks"
+<<functions>>=
+def peer_review_tasks(fbf, activity_id):
+    """Map task types to the tasks of a peer-review activity, or `None`."""
+    document = fbf.get(f"v1/activities/{activity_id}", include="tasks")
+    tasks = {kind: task for (kind, _), task in document.included.items()}
+    return tasks if REVIEW_TASK in tasks else None
+@
+
+The criteria and the allocations are lists behind links of the review task.
+The lists behind the allocations take one request each, which we send in
+parallel and only for allocations whose count says the list is not empty.
+[[allocation_lists]] does that for several relationships at once, so that
+the reviews and the ratings share one pool of requests rather than waiting
+for each other.
+The [[wanted]] map gives, for each relationship, the test of whether an
+allocation has anything there.
+
+<<functions>>=
+def allocation_lists(fbf, allocations, wanted):
+    """Return the resources of the relationships `wanted` of `allocations`.
+
+    `wanted` maps relationship names to a test of whether an allocation has
+    any; allocations without are not asked.
+    """
+    asked = [(name, related_link(allocation, name))
+             for allocation in allocations
+             for name, has_any in wanted.items() if has_any(allocation)]
+    documents = fbf.get_many([(link, {}) for _, link in asked])
+    lists = {name: [] for name in wanted}
+    for (name, _), document in zip(asked, documents):
+        lists[name] += document.resources
+    return lists
+
+
+def counted(name):
+    """Return a test of whether the count `name` of an allocation is > 0."""
+    return lambda allocation: bool(attribute(allocation, name))
+<<imports>>=
+from fbf.discussions import related_link
+@
+
+The options are fetched by id once the ratings are in, from the ids that
+the criteria list and that the ratings chose: a rating's option should be
+among its criterion's, but asking for both costs nothing and makes the
+error above impossible for an option that exists.
+The users are fetched by id too, the reviewers and reviewees of all
+allocations.
+We check the criteria and the people before the hundreds of requests for
+the lists, so that an activity we cannot read fails at once.
+
+<<functions>>=
+def fetch_reviews(fbf, tasks, activity):
+    """Return the `Review`s of a peer-review activity with `tasks`.
+
+    `activity` labels the reviews.
+    """
+    task = tasks[REVIEW_TASK]
+    criteria = fbf.get(related_link(task, "criteria")).resources
+    check_criteria(criteria)
+    allocations = fbf.get(related_link(task, "allocations")).resources
+    users = allocation_users(fbf, allocations)
+    lists = allocation_lists(fbf, allocations,
+                             {"reviews": counted("reviews-count"),
+                              "ratings": counted("ratings-count")})
+    option_ids = [r["id"] for criterion in criteria
+                  for r in relationship(criterion, "options").get("data")
+                  or []]
+    option_ids += [related_id(r, "option") for r in lists["ratings"]]
+    options = fbf.get_by_ids("v1/assignments/criterion_options", option_ids)
+    return make_reviews(activity, allocations, lists["reviews"],
+                        lists["ratings"], criteria, options, users)
+
+
+def allocation_users(fbf, allocations):
+    """Map the ids of the reviewers and reviewees to user resources."""
+    return fbf.get_by_ids("v1/users",
+                          [person(allocation, name)
+                           for allocation in allocations
+                           for name in ("actor", "allocable")])
+@
+
+These functions talk to FBF, so their test needs a recording
+(\cref{Testing}).
+It checks what holds for any peer review on any day: every comment and
+every rating that the allocations count is in the result exactly once, and
+every score is the weight of an option.
+That fails if we skip allocations we should not, lose comments in the
+grouping, or read the levels from the wrong place.
+To keep the recording small it takes the peer review with the fewest
+allocations in the launched course.
+
+<<test functions>>=
+import conftest
+
+@pytest.mark.vcr
+def test_fetch_reviews_accounts_for_every_comment_and_rating(fbf):
+  tasks = min(conftest.review_task_sets(fbf, fbf.login),
+              key=lambda tasks: len(fbf.get(related_link(
+                tasks[REVIEW_TASK], "allocations")).resources))
+  allocations = fbf.get(related_link(tasks[REVIEW_TASK],
+                                     "allocations")).resources
+  result = fetch_reviews(fbf, tasks, "Activity")
+  assert sum(len(r.comments) for r in result) \
+    == sum(a["attributes"]["reviews-count"] for a in allocations)
+  assert sum(r.level != "" for r in result) \
+    == sum(a["attributes"]["ratings-count"] for a in allocations)
+  assert all(r.score is None or isinstance(r.score, int) for r in result)
+@
+
+
+\section{Feedback on the reviews}
+
+A reviewee may rate each review received, if the activity allows it.
+When it does not, the view task's [[reviewer-feedback-enabled]] is false
+and we send no requests at all; the command says so.
+When it does, each allocation that has a review may have feedback, and
+since the allocation has no count for it we have to ask each one.
+
+<<functions>>=
+def feedback_enabled(tasks):
+    """Tell whether the reviewees may rate the reviews they got."""
+    task = tasks.get(VIEW_TASK)
+    return bool(task and attribute(task, "reviewer-feedback-enabled"))
+
+
+def reviewed(allocation):
+    """Tell whether the reviewer of `allocation` wrote or rated anything."""
+    return bool(attribute(allocation, "reviews-count")
+                or attribute(allocation, "ratings-count"))
+
+
+def fetch_feedback(fbf, tasks, activity):
+    """Return the `Feedback` on the reviews of a peer-review activity."""
+    if not feedback_enabled(tasks):
+        return []
+    allocations = fbf.get(related_link(tasks[REVIEW_TASK],
+                                       "allocations")).resources
+    users = allocation_users(fbf, allocations)
+    lists = allocation_lists(fbf, allocations,
+                             {"reviewer-feedback": reviewed})
+    return make_feedback(activity, allocations, lists["reviewer-feedback"],
+                         users)
+@
+
+A feedback belongs to an allocation, which names the reviewer and the
+reviewee.
+
+<<functions>>=
+def make_feedback(activity, allocations, feedbacks, users):
+    """Return the `Feedback`s, sorted by reviewee and reviewer."""
+    by_id = {allocation["id"]: allocation for allocation in allocations}
+    result = []
+    for feedback in feedbacks:
+        allocation = by_id[related_id(feedback, "allocation")]
+        result.append(Feedback(
+            activity,
+            name_of(users, person(allocation, "allocable")),
+            name_of(users, person(allocation, "actor")),
+            attribute(feedback, "rating"),
+            plain_text(attribute(feedback, "body"))))
+    return sorted(result, key=lambda f: (f.reviewee, f.reviewer))
+@
+
+<<test functions>>=
+def feedback(id, alloc, rating, body):
+  return {"type": "reviewer-feedbacks", "id": id,
+          "attributes": {"rating": rating, "body": body},
+          "relationships": {"allocation": ref("assignments/allocation",
+                                              alloc)}}
+
+def test_make_feedback_names_the_parties_of_the_allocation():
+  allocations = [allocation("a1", "u1", "u2"), allocation("a2", "u2", "u3")]
+  result = make_feedback("Essay", allocations,
+                         [feedback("f2", "a2", 2, "Meh"),
+                          feedback("f1", "a1", 5, "Helpful")], USERS)
+  assert [(f.reviewee, f.reviewer, f.rating, f.body) for f in result] == [
+    ("Ada", "Bo", 5, "Helpful"), ("Cy", "Ada", 2, "Meh")]
+
+def test_feedback_enabled_and_reviewed():
+  task = {"type": "submission-review-view-tasks",
+          "attributes": {"reviewer-feedback-enabled": False}}
+  assert not feedback_enabled({VIEW_TASK: task})
+  assert not feedback_enabled({})
+  task["attributes"]["reviewer-feedback-enabled"] = True
+  assert feedback_enabled({VIEW_TASK: task})
+  assert reviewed(allocation("a", reviews=0, ratings=2))
+  assert not reviewed(allocation("a", reviews=0, ratings=0))
+@
+
+The feedback lists must not be asked for allocations without a review, and
+the test of that is [[allocation_lists]] with [[reviewed]].
+A client that answers every request with an empty list and remembers the
+paths is enough here (rung~4 of the testing ladder): the question is which
+requests we send, which a recording would answer too, but only once one
+exists.
+
+<<test functions>>=
+from fbf.api import Document
+
+class ListingClient:
+  def __init__(self):
+    self.asked = []
+  def get_many(self, requests):
+    self.asked += [path for path, _ in requests]
+    return [Document({"data": [{"type": "x", "id": path}]})
+            for path, _ in requests]
+
+def test_allocation_lists_asks_only_allocations_with_something():
+  client = ListingClient()
+  allocations = [allocation("a1", reviews=1, ratings=0),
+                 allocation("a2", reviews=0, ratings=0)]
+  lists = allocation_lists(client, allocations,
+                           {"reviews": counted("reviews-count"),
+                            "ratings": counted("ratings-count"),
+                            "reviewer-feedback": reviewed})
+  assert sorted(client.asked) == ["/f/a1", "/r/a1"]
+  assert {name: [r["id"] for r in found]
+          for name, found in lists.items()} \
+    == {"reviews": ["/r/a1"], "ratings": [], "reviewer-feedback": ["/f/a1"]}
+@
+
+
+\section{Reflections}
+
+The reflections are one list behind the reflect task.
+Their authors are bare references, and the endpoint ignores
+[[include=user]], so we fetch the users by id.
+
+<<functions>>=
+def fetch_reflections(fbf, tasks, activity):
+    """Return the `Reflection`s of a peer-review activity."""
+    task = tasks.get(REFLECT_TASK)
+    if not task:
+        return []
+    reflections = fbf.get(related_link(task, "reflections")).resources
+    users = fbf.get_by_ids("v1/users", [related_id(r, "user")
+                                        for r in reflections])
+    return make_reflections(activity, reflections, users)
+
+
+def make_reflections(activity, reflections, users):
+    """Return the `Reflection`s, sorted by student."""
+    return sorted((Reflection(activity,
+                              name_of(users, related_id(r, "user")),
+                              plain_text(attribute(r, "body")))
+                   for r in reflections),
+                  key=lambda reflection: reflection.student)
+@
+
+<<test functions>>=
+def test_make_reflections_reads_deltas_and_sorts_by_student():
+  def reflection(user, text):
+    return {"type": "reflections", "id": user,
+            "attributes": {"body": {"ops": [{"insert": text}]}},
+            "relationships": {"user": ref("users", user)}}
+  result = make_reflections("Essay", [reflection("u3", "Agreed"),
+                                      reflection("u2", "Fun\n")], USERS)
+  assert [(r.student, r.body) for r in result] \
+    == [("Ada", "Fun\n"), ("Cy", "Agreed")]
+@
+
+
+\section{Output}
+
+The output follows [[canvaslms]], as in \cref{Discussions}: one row per
+item, fields separated by the delimiter, tab by default.
+By default a row is a [[Review]]: the activity, the reviewee, the reviewer,
+the criterion, the level, the score, and the comments joined by
+[[ | ]].
+With [[--long]] every comment gets a row of its own, with what it is about
+and when it was written, which is what reading the comments needs.
+A review that has a level but no comment still gets a row then, with the
+comment's fields empty, so that [[--long]] shows everything the default
+does.
+Line breaks in a text would break the rows, so we fold them into spaces.
+The score is the option's weight as FBF stores it; how FBF turns weights
+into a grade we do not know, so we do not add them up.
+
+<<constants>>=
+COMMENT_SEPARATOR = " | "
+<<functions>>=
+def review_rows(reviews, long=False):
+    """Yield output rows (lists of strings) for `reviews`."""
+    for review in reviews:
+        head = [review.activity, review.reviewee, review.reviewer,
+                review.criterion, review.level,
+                "" if review.score is None else str(review.score)]
+        if not long:
+            yield head + [COMMENT_SEPARATOR.join(fold(c.body)
+                                                 for c in review.comments)]
+            continue
+        for comment in review.comments or [Comment("", "", "")]:
+            yield head + [comment.on, comment.created, fold(comment.body)]
+
+
+def fold(text):
+    """Return `text` on one line, runs of white space made one space."""
+    return " ".join(text.split())
+@
+
+<<test functions>>=
+REVIEWS = [Review("Essay", "Ada", "Bo", "Overall", comments=[
+             Comment("activity", "t1", "Fine\nwork"),
+             Comment("submission", "t2", "Typo")]),
+           Review("Essay", "Ada", "Cy", "Clarity", "Clear", 1)]
+
+def test_review_rows_short_and_long():
+  assert list(review_rows(REVIEWS)) == [
+    ["Essay", "Ada", "Bo", "Overall", "", "", "Fine work | Typo"],
+    ["Essay", "Ada", "Cy", "Clarity", "Clear", "1", ""]]
+  assert [row[2:] for row in review_rows(REVIEWS, long=True)] == [
+    ["Bo", "Overall", "", "", "activity", "t1", "Fine work"],
+    ["Bo", "Overall", "", "", "submission", "t2", "Typo"],
+    ["Cy", "Clarity", "Clear", "1", "", "", ""]]
+@
+
+Feedback and reflections have one row per item, their fields in order.
+
+<<functions>>=
+def feedback_rows(feedbacks):
+    """Yield output rows for reviewer `feedbacks`."""
+    for f in feedbacks:
+        yield [f.activity, f.reviewee, f.reviewer, str(f.rating),
+               fold(f.body)]
+
+
+def reflection_rows(reflections):
+    """Yield output rows for `reflections`."""
+    for r in reflections:
+        yield [r.activity, r.student, fold(r.body)]
+@
+
+<<test functions>>=
+def test_feedback_and_reflection_rows():
+  assert list(feedback_rows([Feedback("E", "Ada", "Bo", 4, "Good\n")])) \
+    == [["E", "Ada", "Bo", "4", "Good"]]
+  assert list(reflection_rows([Reflection("E", "Ada", " I\nlearnt ")])) \
+    == [["E", "Ada", "I learnt"]]
+@
+
+
+\section{The command}
+
+The command works like [[discussions]] (\cref{Discussions}): it takes the
+[[canvaslms]] assignment options, finds the FBF activities of the selected
+assignments in their course round (\cref{Canvas}), and lists what was
+written in each.
+Assignments that are not FBF's are dropped, so [[-c]] alone lists every
+peer review in a course.
+FBF activities that are not peer reviews, those not yet opened this round,
+and, with [[--feedback]], peer reviews without reviewer feedback, are
+skipped with a note on standard error.
+Everything is labelled with the Canvas assignment name, by which the user
+selected it, and comes in the order of the assignments.
+
+The three views share all of this and differ in what they fetch and how
+they print it, so the command picks a fetcher and a row maker by the
+options.
+
+<<imports>>=
+import json
+import sys
+import canvaslms.cli
+import canvaslms.cli.assignments
+import canvaslms.cli.cache
+import canvaslms.cli.login
+from fbf import canvas as fbfcanvas
+<<functions>>=
+def reviews_command(config, canvas, args):
+    """List the peer reviews of the selected FBF assignments."""
+    assignments = [a for a in
+                   canvaslms.cli.assignments.process_assignment_option(
+                       canvas, args)
+                   if fbfcanvas.placement_code(a)]
+    if not assignments:
+        raise canvaslms.cli.EmptyListError("No FeedbackFruits assignments")
+    fetch = (fetch_feedback if args.feedback
+             else fetch_reflections if args.reflections
+             else fetch_reviews)
+    hostname, token = canvaslms.cli.login.load_credentials(config)
+    items = []
+    for assignment, fbf, activity in fbfcanvas.fbf_activities(
+            canvaslms.cli.cache.normalize_hostname(hostname), token,
+            assignments):
+        <<add the [[items]] of [[activity]], or say why not>>
+    <<output [[items]] as [[args]] say>>
+@
+
+<<add the [[items]] of [[activity]], or say why not>>=
+tasks = peer_review_tasks(fbf, activity) if activity else None
+if not activity:
+    skipped(assignment, "not opened in FeedbackFruits this course round")
+elif not tasks:
+    skipped(assignment, "not a peer review")
+elif args.feedback and not feedback_enabled(tasks):
+    skipped(assignment, "reviewer feedback is not enabled")
+else:
+    items += fetch(fbf, tasks, assignment.name)
+<<functions>>=
+def skipped(assignment, reason):
+    """Note on standard error that `assignment` is skipped and why."""
+    print(f"{assignment.name}: {reason}, skipped", file=sys.stderr)
+@
+
+JSON output keeps each review's comments as a list, which rows flatten.
+
+<<output [[items]] as [[args]] say>>=
+if args.json:
+    json.dump([dataclasses.asdict(item) for item in items],
+              sys.stdout, indent=2, ensure_ascii=False)
+    print()
+else:
+    rows = (feedback_rows(items) if args.feedback
+            else reflection_rows(items) if args.reflections
+            else review_rows(items, long=args.long))
+    delimiter = getattr(args, "delimiter", "\t")
+    for row in rows:
+        print(delimiter.join(row))
+@
+
+The views exclude each other, which [[argparse]] enforces.
+[[--long]] concerns only the reviews.
+
+<<functions>>=
+def add_command(subp):
+    """Add the `reviews` command to `subp`."""
+    parser = subp.add_parser(
+        "reviews",
+        help="List the peer reviews of FBF peer-feedback activities",
+        description="List the peer reviews of FeedbackFruits peer-feedback "
+                    "activities: activity, reviewee, reviewer, criterion, "
+                    "level, score and comments; or the reviewees' feedback "
+                    "on the reviews, or the reflections.")
+    canvaslms.cli.assignments.add_assignment_option(parser, ungraded=False)
+    parser.add_argument("-l", "--long", action="store_true",
+                        help="one row per comment instead of per criterion: "
+                             "adds what it is on and when it was written")
+    view = parser.add_mutually_exclusive_group()
+    view.add_argument("--feedback", action="store_true",
+                      help="list the reviewees' ratings of the reviews: "
+                           "activity, reviewee, reviewer, rating, text")
+    view.add_argument("--reflections", action="store_true",
+                      help="list the reflections: activity, student, text")
+    parser.add_argument("--json", action="store_true",
+                        help="print as JSON, reviews with their comments")
+    parser.set_defaults(func=reviews_command)
+@
+
+
+\section{Examples for the contract test}
+
+The contract test of \cref{Schema} needs an example of every type declared
+above.
+They all hang off the tasks of peer-feedback activities, but the launched
+activity is a video, so the fetchers search the activities of the launched
+course whose [[tool]] is [[peerfeedback]], in the order FBF lists them,
+until they find the type.
+The first peer review in our course has comment criteria only, and
+feedback exists only where it is enabled, so the search may
+take a few activities; it skips those where feedback is off, which would
+otherwise cost a request per allocation for nothing.
+The lists behind the allocations are fetched lazily, one allocation at a
+time, so that a search stops at the first example rather than fetching an
+activity's 800 lists.
+A type that cannot be found raises with its name.
+Activities and users are declared by \cref{Discussions} too, and their
+fetchers are there.
+These chunks are tangled into [[conftest.py]] with the fetchers of the other
+chapters, hence the import and the prefixed names.
+
+<<example fetchers>>=
+from fbf import reviews as review
+
+
+def review_task_sets(fbf, launched):
+    """Yield the tasks of the peer reviews in the launched course."""
+    for activity in fbf.get(
+            f"v1/courses/{launched.course_uuid}/activities").resources:
+        if (activity.get("attributes") or {}).get("tool") == "peerfeedback":
+            tasks = review.peer_review_tasks(fbf, activity["id"])
+            if tasks:
+                yield tasks
+
+
+def review_example(fbf, launched, kind, resources_of):
+    """Return the first resource of `kind` among `resources_of` some tasks."""
+    for tasks in review_task_sets(fbf, launched):
+        for resource in resources_of(fbf, tasks):
+            if resource["type"] == kind:
+                return resource
+    raise LookupError(f"no {kind} in the launched course")
+
+
+def review_list(name, task=review.REVIEW_TASK):
+    """Return a function listing the relationship `name` of a task."""
+    return lambda fbf, tasks: (fbf.get(review.related_link(tasks[task],
+                                                           name)).resources
+                               if task in tasks else [])
+
+
+def review_allocation_list(name, has_any, only_if=lambda tasks: True):
+    """Return a function listing `name` of each allocation, lazily.
+
+    Tasks for which `only_if` is false are not searched.
+    """
+    def resources(fbf, tasks):
+        if not only_if(tasks):
+            return
+        for allocation in review_list("allocations")(fbf, tasks):
+            if has_any(allocation):
+                yield from fbf.get(review.related_link(allocation,
+                                                       name)).resources
+    return resources
+
+
+def review_options(fbf, tasks):
+    """List the options of the rubric criteria of a review task."""
+    criteria = review_list("criteria")(fbf, tasks)
+    return fbf.get_by_ids("v1/assignments/criterion_options",
+                          [r["id"] for c in criteria
+                           for r in c["relationships"]["options"]["data"]
+                           or []]).values()
+
+
+for kind in [review.REVIEW_TASK, review.VIEW_TASK, review.REFLECT_TASK]:
+    example(kind)(lambda fbf, launched, kind=kind:
+                  review_example(fbf, launched, kind,
+                                 lambda fbf, tasks: tasks.values()))
+
+example("assignments/allocation")(
+    lambda fbf, launched: review_example(fbf, launched,
+                                         "assignments/allocation",
+                                         review_list("allocations")))
+
+for kind in review.CRITERION_TYPES:
+    example(kind)(lambda fbf, launched, kind=kind:
+                  review_example(fbf, launched, kind,
+                                 review_list("criteria")))
+
+example("assignments/criterion-option")(
+    lambda fbf, launched: review_example(fbf, launched,
+                                         "assignments/criterion-option",
+                                         review_options))
+
+for kind, name, has_any in [
+        ("reviews", "reviews", review.counted("reviews-count")),
+        ("ratings", "ratings", review.counted("ratings-count"))]:
+    example(kind)(lambda fbf, launched, kind=kind, name=name,
+                  has_any=has_any:
+                  review_example(fbf, launched, kind,
+                                 review_allocation_list(name, has_any)))
+
+example("reviewer-feedbacks")(
+    lambda fbf, launched: review_example(
+        fbf, launched, "reviewer-feedbacks",
+        review_allocation_list("reviewer-feedback", review.reviewed,
+                               review.feedback_enabled)))
+
+example("reflections")(
+    lambda fbf, launched: review_example(
+        fbf, launched, "reflections",
+        review_list("reflections", review.REFLECT_TASK)))
+@
