@@ -474,12 +474,16 @@ def assemble(assignment, tasks, progresses, sent, student_of, students,
 
     `student_of` maps actor ids to students (see `match_actors`).
     """
-    rows = {}
+    chosen = {}
     for resource in progresses:
         student = student_of.get(related_id(resource, "actor"))
-        if student is not None:
-            rows[student.id] = progress_row(assignment, resource, tasks,
-                                            sent, student, scores)
+        if student is not None and (
+                student.id not in chosen
+                or preference(resource) > preference(chosen[student.id][1])):
+            chosen[student.id] = (student, resource)
+    rows = {id: progress_row(assignment, resource, tasks, sent, student,
+                             scores)
+            for id, (student, resource) in chosen.items()}
     for student in students:
         if student.id not in rows:
             rows[student.id] = Progress(
@@ -494,6 +498,24 @@ def student_name(student):
     """Return the name we show for a Canvas `student`."""
     return (getattr(student, "login_id", None)
             or getattr(student, "email", None) or str(student.id))
+@
+
+A student can have more than one progress.
+FBF knows people by two types, [[users]] and [[people]], and the same
+address could belong to one of each.
+Our course had no such student among its 180 students in 62 activities, but
+if one came, letting the last progress win, as a plain dictionary would,
+could replace a published grade by an empty [[people]] progress: the row
+would show no grade sent, and the grade Canvas has as a mismatch.
+The progress that matters is the one FBF graded from, so we prefer the one
+with a grade sent, and otherwise the one with the higher overall grade.
+The command notes how many progresses it set aside (\cref{progress-fetch}).
+
+<<functions>>=
+def preference(resource):
+    """Sort key: which of a student's progresses explains the grade."""
+    overall = (attribute(resource, "grades") or {}).get("overall") or 0
+    return (related_id(resource, "latest-grade") is not None, overall)
 @
 
 The row of a student with progress fills in the FBF side.
@@ -555,6 +577,32 @@ def test_published_comes_from_the_progress():
                                                   grade="gone")],
                    SENT, {"a1": STUDENTS[0]}, STUDENTS[:1], {})
   assert (row.published, row.sent_grade) == (True, None)
+@
+
+A student can have two progresses, through two FBF actors with the same
+address, and the one with the grade sent must win, whichever comes first
+and even over a higher overall grade; without grades, the higher overall
+grade wins.
+
+<<test functions>>=
+def test_assemble_prefers_the_graded_progress_of_a_student():
+  graded = progress("a1", published="2026-10-01", grade="g1")
+  other = progress("p1", overall=80.0, grades={}, kind="people")
+  for progresses in ([graded, other], [other, graded]):
+    [row] = assemble(ASSIGNMENT, [VIDEO], progresses, SENT,
+                     {"a1": STUDENTS[0], "p1": STUDENTS[0]}, STUDENTS[:1],
+                     {1: 6.0})
+    assert (row.fbf_actor_id, row.sent_grade, mismatch(row)) \
+      == ("a1", 0.6, False)
+
+def test_assemble_prefers_the_higher_overall_without_grades():
+  low = progress("a1", overall=40.0, grades={"t1": {"viewed": 40}})
+  high = progress("p1", kind="people")
+  for progresses in ([low, high], [high, low]):
+    [row] = assemble(ASSIGNMENT, [VIDEO], progresses, {},
+                     {"a1": STUDENTS[0], "p1": STUDENTS[0]}, STUDENTS[:1],
+                     {})
+    assert row.overall == 60.0
 @
 
 
@@ -713,6 +761,7 @@ def test_filters():
 
 
 \section{Fetching}
+\label{progress-fetch}
 
 The FBF side of an assignment takes four kinds of request, the Canvas side
 two.
@@ -864,9 +913,9 @@ def assignment_progress(fbf, canvas, assignment, activity_id, emails,
     members = course_students(canvas, assignment.course_id, students)
     student_of = match_actors({actor: emails[actor] for actor in actors},
                               members)
-    rows = assemble(assignment, tasks, progresses,
-                    sent_grades(fbf, progresses), student_of, members,
-                    canvas_scores(assignment))
+    sent = sent_grades(fbf, progresses)
+    rows = assemble(assignment, tasks, progresses, sent, student_of,
+                    members, canvas_scores(assignment))
     <<warn about actors left out and grades not explained>>
     return rows
 @
@@ -876,6 +925,7 @@ if len(actors) > len(student_of):
     print(f"{assignment.name}: {len(actors) - len(student_of)} FBF "
           "participants are not students in Canvas, left out",
           file=sys.stderr)
+<<warn about progresses set aside>>
 graded = [row for row in rows if row.overall is not None]
 unexplained = sum(1 for row in graded
                   if not adds_up(row.facets, row.overall))
@@ -883,6 +933,19 @@ if unexplained:
     print(f"{assignment.name}: {unexplained} of {len(graded)} breakdowns "
           "do not add up to the overall grade; FeedbackFruits may have "
           "changed how it grades", file=sys.stderr)
+@
+
+A student with two progresses shows only one (see [[preference]]).
+That should not happen, so when it does we count it, rather than leave the
+other progress unmentioned.
+
+<<warn about progresses set aside>>=
+set_aside = (sum(1 for progress in progresses
+                 if related_id(progress, "actor") in student_of)
+             - len({student.id for student in student_of.values()}))
+if set_aside:
+    print(f"{assignment.name}: {set_aside} progresses set aside for "
+          "students with more than one", file=sys.stderr)
 @
 
 
