@@ -576,6 +576,8 @@ reference.
 [[fbf har-diff]] compares a HAR with the reference.
 It exits with status~1 when the launch changed or something was removed,
 so that it can guard a script.
+A removed name that [[fbf]] reads, according to [[REQUIRED]] of
+\cref{Schema}, is marked with [[!!]]: that is the change to fix first.
 
 Both work without Canvas, and their arguments are files, so they follow the
 command convention of [[canvaslms]], [[(config, canvas, args)]], and ignore
@@ -586,6 +588,7 @@ subcommands unchanged.
 <<imports>>=
 import pathlib
 import sys
+from fbf.schema import REQUIRED
 <<constants>>=
 REFERENCE_SHAPE = "doc/fbf-api-shape.txt"
 SHAPE_HEADER = """\
@@ -624,9 +627,29 @@ def har_diff_command(config, canvas, args):
     for kind, lines in diff.items():
         if lines:
             print(f"{kind}:")
-            print("\n".join(f"  {line}" for line in lines))
+            print("\n".join(("!!" if line in REQUIRED else "  ") + line
+                            for line in lines))
     if diff["launch"] or diff["removed"]:
         sys.exit(1)
+@
+
+Let's verify the command end to end on files: a capture that renamed an
+attribute we require must exit with status~1 and mark the removal.
+
+<<test functions>>=
+def test_har_diff_command_marks_required_removal(tmp_path, capsys):
+  import argparse, pytest
+  from fbf.schema import requires
+  requires("tasks", attributes=["title"])
+  reference = tmp_path / "shape.txt"
+  reference.write_text("\n".join(har_shape([sample_har("title")])))
+  capture = tmp_path / "new.har"
+  capture.write_text(json.dumps(sample_har("name")))
+  args = argparse.Namespace(har=[str(capture)], reference=str(reference))
+  with pytest.raises(SystemExit) as exit:
+    har_diff_command(None, None, args)
+  assert exit.value.code == 1
+  assert "!!type tasks attribute title" in capsys.readouterr().out
 @
 
 The arguments are registered by a function of their own, so that the

@@ -1,0 +1,122 @@
+\chapter{What we depend on}
+\label{Schema}
+
+The extractors read attributes and relationships whose names FBF chose and
+may change.
+This chapter keeps those dependencies explicit, for three uses.
+\begin{description}
+\item[At run time] an extractor reads a name through [[attribute]] or
+  [[relationship]], which raise [[SchemaError]] when the name is missing.
+  A rename then fails with \enquote{comments: no attribute 'body'} rather
+  than a [[KeyError]] deep in the code, or worse, an empty column.
+\item[In a diff] [[fbf har-diff]] marks the removed names that we depend
+  on, which separates the changes that break us from the ones that do not.
+\item[In the live tests] each declared name is checked against FBF.
+\end{description}
+
+The declaration is the set [[REQUIRED]] of shape records, in the format of
+\cref{HAR}: [[type comments attribute body]].
+Using the shape's own format makes the comparison with a diff a set
+intersection.
+Each extractor declares its names in its own chapter, next to the code that
+reads them, with [[requires]] in a chunk [[<<required names>>]]; the
+build tangles those chunks from all chapters into this module.
+
+<<[[schema.py]]>>=
+"""The FeedbackFruits names that fbf depends on, and checked access."""
+
+REQUIRED = set()
+
+<<functions>>
+
+<<required names>>
+@
+
+<<test [[schema.py]]>>=
+from fbf.schema import *
+
+<<test functions>>
+@
+
+
+\section{Declaring names}
+
+The chunk starts empty here; every extractor chapter adds its declarations.
+
+<<required names>>=
+# Declarations of the extractor chapters follow.
+<<functions>>=
+def requires(kind, attributes=(), relationships=()):
+    """Declare that fbf reads these names of the JSON:API type `kind`."""
+    REQUIRED.update(f"type {kind} attribute {name}" for name in attributes)
+    REQUIRED.update(f"type {kind} relationship {name}"
+                    for name in relationships)
+@
+
+
+\section{Checked access}
+
+The accessors distinguish a missing name from a missing value.
+An attribute that is present but [[null]] is normal (a comment without
+upvotes, a deadline not set) and gives [[None]]; an attribute that is
+absent from the resource means that FBF changed, and raises.
+The message points to the recovery procedure, since that is what the reader
+of the error needs next.
+
+<<functions>>=
+class SchemaError(Exception):
+    """A resource lacks a name that fbf depends on."""
+
+    def __init__(self, resource, kind, name):
+        super().__init__(
+            f"{resource.get('type')}: no {kind} {name!r}; FeedbackFruits may "
+            "have changed its API, see the recovery procedure (fbf har-diff)")
+
+
+def attribute(resource, name):
+    """Return the attribute `name` of `resource`; raise `SchemaError`."""
+    attributes = resource.get("attributes") or {}
+    if name not in attributes:
+        raise SchemaError(resource, "attribute", name)
+    return attributes[name]
+
+
+def relationship(resource, name):
+    """Return the relationship `name` of `resource`; raise `SchemaError`."""
+    relationships = resource.get("relationships") or {}
+    if name not in relationships:
+        raise SchemaError(resource, "relationship", name)
+    return relationships[name]
+
+
+def related_id(resource, name):
+    """Return the id of the to-one relationship `name`, or `None`."""
+    data = relationship(resource, name).get("data")
+    return data["id"] if data else None
+@
+
+<<test functions>>=
+import pytest
+
+COMMENT = {"type": "comments", "id": "c",
+           "attributes": {"body": "Hi", "upvotes-count": None},
+           "relationships": {"user": {"data": {"type": "users", "id": "u"}},
+                             "flag": {"data": None}}}
+
+def test_attribute_distinguishes_null_from_missing():
+  assert attribute(COMMENT, "body") == "Hi"
+  assert attribute(COMMENT, "upvotes-count") is None
+  with pytest.raises(SchemaError, match="comments: no attribute 'text'"):
+    attribute(COMMENT, "text")
+
+def test_related_id():
+  assert related_id(COMMENT, "user") == "u"
+  assert related_id(COMMENT, "flag") is None
+  with pytest.raises(SchemaError):
+    related_id(COMMENT, "author")
+
+def test_requires_records_shape_lines():
+  requires("test-type", attributes=["a"], relationships=["r"])
+  assert {"type test-type attribute a",
+          "type test-type relationship r"} <= REQUIRED
+@
