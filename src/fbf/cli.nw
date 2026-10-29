@@ -128,15 +128,25 @@ def main():
 The HAR commands read files and need no Canvas; creating a Canvas object
 for them would demand credentials for nothing.
 We recognise them by the wrapped function.
-The others get the Canvas object from [[canvaslms]]'s cache, which also
-caches course and assignment lists between runs, so we save it afterwards as
-[[canvaslms]] does.
+[[canvaslms]] faces the same question for its own commands, and it cannot
+see through our wrapper, so we answer it in a function that both programs
+call: [[canvaslms]] adds [[not fbf.cli.needs_canvas(func)]] to its list of
+commands that need no Canvas.
 
 <<constants>>=
 COMMANDS_WITHOUT_CANVAS = {fbf.har.har_shape_command,
                            fbf.har.har_diff_command}
+<<functions>>=
+def needs_canvas(func):
+    """True unless the fbf command `func` works without a Canvas object."""
+    return getattr(func, "__wrapped__", func) not in COMMANDS_WITHOUT_CANVAS
+@
+
+The others get the Canvas object from [[canvaslms]]'s cache, which also
+caches course and assignment lists between runs, so we save it afterwards as
+[[canvaslms]] does.
 <<run [[args.func]], with Canvas if it needs it>>=
-if args.func.__wrapped__ in COMMANDS_WITHOUT_CANVAS:
+if not needs_canvas(args.func):
     args.func(config, None, args)
     return
 try:
@@ -151,4 +161,25 @@ except (canvaslms.cli.EmptyListError,
     canvaslms.cli.err(1, str(error))
 finally:
     canvaslms.cli.cache.save_canvas_cache(canvas, token, hostname)
+@
+
+Let's verify the predicate the way both programs use it: on the function
+that the parsers set for a command line.
+We parse through [[add_command]], as [[canvaslms]] would, so that the test
+also covers the nesting under [[fbf]] and the wrapping of every command.
+<<test [[cli.py]]>>=
+import argparse
+
+import fbf.cli
+
+def command_of(*argv):
+  parser = argparse.ArgumentParser()
+  fbf.cli.add_command(parser.add_subparsers(dest="command"))
+  return parser.parse_args(["fbf", *argv]).func
+
+def test_only_the_har_commands_work_without_canvas():
+  assert not fbf.cli.needs_canvas(command_of("har-shape", "x.har"))
+  assert not fbf.cli.needs_canvas(command_of("har-diff", "x.har"))
+  assert fbf.cli.needs_canvas(command_of("discussions"))
+  assert fbf.cli.needs_canvas(command_of("progress"))
 @
