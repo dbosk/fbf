@@ -138,6 +138,38 @@ def connect(canvas_url, canvas_token, assignments):
 @
 
 
+\section{Naming assignments in the output}
+
+The commands label their rows with the Canvas assignment name, which is how
+the user selected them.
+But names need not be unique: course 63874 has two FBF assignments with the
+same name, and their rows could not be told apart.
+We therefore add the assignment id to a name that repeats among the selected
+assignments, and only then, since an id in every row would be noise in the
+common case.
+A name is compared exactly as Canvas shows it.
+
+<<imports>>=
+import collections
+<<functions>>=
+def assignment_labels(assignments):
+    """Map assignment ids to labels: the name, plus the id if it repeats."""
+    counts = collections.Counter(a.name for a in assignments)
+    return {a.id: a.name if counts[a.name] == 1 else f"{a.name} ({a.id})"
+            for a in assignments}
+@
+
+<<test functions>>=
+def named(id, name):
+  return SimpleNamespace(id=id, name=name)
+
+def test_assignment_labels_add_the_id_only_to_repeated_names():
+  labels = assignment_labels([named(1, "Week 1"), named(2, "Quiz"),
+                              named(3, "Quiz")])
+  assert labels == {1: "Week 1", 2: "Quiz (2)", 3: "Quiz (3)"}
+@
+
+
 \section{Finding the activities of this round}
 
 The [[code]] in a Canvas assignment's launch URL is not specific to the

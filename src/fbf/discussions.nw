@@ -534,7 +534,8 @@ Assignments that are not FBF's are skipped, so [[-c]] alone lists every
 discussion in a course; so are those not yet opened in FBF this round, with
 a note on standard error.
 The threads are labelled with the Canvas assignment name, which is the name
-the user selected them by.
+the user selected them by, with the id added where names repeat
+(\cref{Canvas}).
 
 <<imports>>=
 import json
@@ -554,14 +555,15 @@ def discussions_command(config, canvas, args):
     if not assignments:
         raise canvaslms.cli.EmptyListError("No FeedbackFruits assignments")
     hostname, token = canvaslms.cli.login.load_credentials(config)
+    labels = fbfcanvas.assignment_labels(assignments)
     threads = []
     for assignment, fbf, activity in fbfcanvas.fbf_activities(
             canvaslms.cli.cache.normalize_hostname(hostname), token,
             assignments):
         if activity:
-            threads += activity_threads(fbf, activity, assignment.name)
+            threads += activity_threads(fbf, activity, labels[assignment.id])
         else:
-            print(f"{assignment.name}: not opened in FeedbackFruits "
+            print(f"{labels[assignment.id]}: not opened in FeedbackFruits "
                   "this course round, skipped", file=sys.stderr)
     <<output [[threads]] as [[args]] say>>
 @

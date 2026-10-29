@@ -1190,14 +1190,16 @@ def reviews_command(config, canvas, args):
     if not assignments:
         raise canvaslms.cli.EmptyListError("No FeedbackFruits assignments")
     hostname, token = canvaslms.cli.login.load_credentials(config)
+    labels = fbfcanvas.assignment_labels(assignments)
     items = []
     for assignment, fbf, activity in fbfcanvas.fbf_activities(
             canvaslms.cli.cache.normalize_hostname(hostname), token,
             assignments):
+        label = labels[assignment.id]
         try:
-            items += activity_items(fbf, activity, assignment.name, args)
+            items += activity_items(fbf, activity, label, args)
         except Skipped as reason:
-            print(f"{assignment.name}: {reason}, skipped", file=sys.stderr)
+            print(f"{label}: {reason}, skipped", file=sys.stderr)
     <<output [[items]] as [[args]] say>>
 @
 
