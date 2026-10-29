@@ -371,7 +371,7 @@ def har_entry(method, url, status, mime="", text="", headers=(),
           "response": {"status": status, "headers": list(headers),
                        "content": {"mimeType": mime, "text": text}}}
 
-SECRET = "s3cr3t-cookie-value"
+PLANTED_COOKIE = "planted-cookie-value"
 STUDENT = "Alice Studentsson"
 
 def sample_har(attribute="title"):
@@ -387,7 +387,8 @@ def sample_har(attribute="title"):
     har_entry("POST", "https://api.feedbackfruits.com/v1/lti/login", 302,
               params=["login_hint"],
               headers=[{"name": "Set-Cookie",
-                        "value": f"lti_cookie_probe={SECRET}; secure"}]),
+                        "value":
+                          f"lti_cookie_probe={PLANTED_COOKIE}; secure"}]),
     har_entry("GET", "https://cdn.example.com/app.js", 200,
               "application/javascript"),
     har_entry("OPTIONS", f"https://api.feedbackfruits.com/v1/tasks/{UUID1}",
@@ -421,7 +422,8 @@ def test_har_shape_skips_redirecting_images():
 
 def test_har_shape_holds_no_values():
   shape = "\n".join(har_shape([sample_har()]))
-  assert SECRET not in shape and STUDENT not in shape and UUID1 not in shape
+  assert PLANTED_COOKIE not in shape
+  assert STUDENT not in shape and UUID1 not in shape
 @
 
 
