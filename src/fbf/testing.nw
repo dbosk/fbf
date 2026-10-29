@@ -1000,7 +1000,7 @@ def _collect(self, obj, parent=None):
     if isinstance(obj, dict):
         obj = {key: redact_secret(key, value) for key, value in obj.items()}
         if parent != "relationships":
-            obj = {key: self._structured_free_text(key, value)
+            obj = {key: self._free_text(key, value)
                    for key, value in obj.items()}
         if is_person_resource(obj):
             return {key: self._collect(
@@ -1122,6 +1122,8 @@ In JSON:API, [[comments]] and [[note]] are also names of relationships,
 whose values are objects with [[data]] and [[links]]; those name resources
 rather than hold text, and the client follows them, so the rule leaves the
 [[relationships]] object alone.
+The method that applies the rule, [[_free_text]], also decides which texts
+are worth noting (\cref{FreeTextNoted}).
 <<scrubbing for FBF>>=
 def strings_in(value):
     """Yield the strings anywhere in `value`."""
@@ -1142,15 +1144,6 @@ def text_placeholder(value):
     if isinstance(value, list):
         return [vcr_support.FREE_TEXT_PLACEHOLDER]
     return vcr_support.FREE_TEXT_PLACEHOLDER
-<<[[FBFPseudonymizer]] methods>>=
-def _structured_free_text(self, key, value):
-    """Return the placeholder for free text in an object or a list."""
-    name = str(key).lower()
-    if (name not in self.free_text_keys or name in self.keep_text
-            or not isinstance(value, (dict, list))):
-        return value
-    self._log(*strings_in(value))
-    return text_placeholder(value)
 @
 
 Let's verify it on a reflection with a Delta body and on a comment whose
@@ -1179,6 +1172,63 @@ def test_recordings_replace_free_text_that_is_not_a_string(scrubber):
   assert comment["attributes"]["body"] == ["[redacted free text]"]
   assert reflection["relationships"]["comments"]["links"]["related"] \
     == "/v1/reflections/r1/comments"
+@
+
+\subsubsection{Which free text to look for}
+\label{FreeTextNoted}
+
+Every free text that the pseudonymizer replaces is noted as an original, so
+that the scan after the run can look for it elsewhere.
+The scan looks for whole words, and some free texts are a single word: the
+answer to a true-or-false question is [[true]] or [[false]], other answers
+are [[yes]] or a short word in Swedish, and a Delta's formatting holds words
+such as [[bullet]].
+The first recording noted all of them, and the scan found [[true]] and
+[[false]] in every JSON body, as literals, some twenty thousand times.
+A single word cannot be told from the same word elsewhere, and it says
+nothing about anyone on its own.
+So we still replace every free text, but note only those of two words or
+more, which a coincidence will not reproduce; for the words of a Delta, the
+same goes for each of its strings.
+Names are not affected: the pseudonymizer notes those, and their parts, as
+it always did.
+<<scrubbing for FBF>>=
+def identifying(text):
+    """True if the free text `text` is worth looking for elsewhere."""
+    return len(text.split()) >= 2
+<<[[FBFPseudonymizer]] methods>>=
+def _free_text(self, key, value):
+    """Return the placeholder for the free text `value` under `key`, noting
+    the text if it is worth looking for."""
+    name = str(key).lower()
+    if (name not in self.free_text_keys or name in self.keep_text
+            or not value or isinstance(value, (int, float, bool))
+            or (isinstance(value, str) and is_ours(value))):
+        return value
+    self._log(*[text for text in strings_in(value) if identifying(text)])
+    return (text_placeholder(value) if isinstance(value, (dict, list))
+            else vcr_support.FREE_TEXT_PLACEHOLDER)
+@
+
+Let's verify that single words are replaced but not noted, while longer
+texts are both, all made up.
+<<test functions>>=
+def test_single_words_are_replaced_but_not_noted(tmp_path):
+  originals = tmp_path / "originals.txt"
+  scrubber = conftest.FBFPseudonymizer(b"a key for the tests", originals)
+  answers = {"data": [
+    {"type": "open-answers", "id": "a1", "attributes": {"body": "true"}},
+    {"type": "open-answers", "id": "a2",
+     "attributes": {"body": "Ask Bo Berg",
+                    "body-rendered": {"ops": [
+                      {"insert": "Ask Bo Berg\n",
+                       "attributes": {"list": "bullet"}}]}}}]}
+  scrubbed = scrubber.scrub_json(answers)
+  assert "true" not in json.dumps(scrubbed)
+  assert "Bo Berg" not in json.dumps(scrubbed)
+  noted = conftest.vcr_support.read_list(originals)
+  assert "Ask Bo Berg" in noted
+  assert "true" not in noted and "bullet" not in noted
 @
 
 \subsubsection{Keywords}
