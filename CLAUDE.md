@@ -20,6 +20,10 @@ Literate programs (noweb). Edit the `.nw` files, never the tangled `.py`/`.tex`
 - `src/fbf/reviews.nw`: `fbf reviews`: peer reviews of peerfeedback
   activities (levels, scores, comments; `--feedback`, `--reflections`);
   documents the endpoints never to call.
+- `src/fbf/progress.nw`: `fbf progress`: per-student grade breakdown
+  (facet points = weight × completion, sum = overall, sent grade =
+  overall/100), checked against Canvas scores (`--mismatch`,
+  `--unpublished`). FBF users map to Canvas by email.
 - `src/fbf/cli.nw`: standalone `fbf` and `add_command(subp)` for canvaslms;
   commands follow canvaslms's `(config, canvas, args)` convention.
 - `src/fbf/har.nw`: `har-shape`/`har-diff`: value-free shapes of HAR captures;
