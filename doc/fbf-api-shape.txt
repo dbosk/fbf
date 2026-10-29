@@ -1,0 +1,242 @@
+# The shape of FeedbackFruits' launch and API, made by `fbf har-shape`.
+# Names only, no values.  Compare a fresh capture with `fbf har-diff`.
+launch GET canvas.kth.se/courses/{n}/modules/items/{n} 302 cookies=_csrf_token,log_session_id
+launch GET canvas.kth.se/courses/{n}/assignments/{n} 200 cookies=_csrf_token,log_session_id form=api.feedbackfruits.com/v1/lti/login:canvas_environment,canvas_region,client_id,iss,login_hint,lti_deployment_id,lti_message_hint,lti_storage_target,target_link_uri
+launch POST api.feedbackfruits.com/v1/lti/login 307 fields=canvas_environment,canvas_region,client_id,iss,login_hint,lti_deployment_id,lti_message_hint,lti_storage_target,target_link_uri
+launch POST api.eu.feedbackfruits.com/v1/lti/login 302 fields=canvas_environment,canvas_region,client_id,iss,login_hint,lti_deployment_id,lti_message_hint,lti_storage_target,target_link_uri cookies=lti_cookie_probe
+launch GET canvas.kth.se/api/lti/authorize_redirect 302 cookies=log_session_id
+launch GET canvas.kth.se/api/lti/authorize 200 cookies=_csrf_token,log_session_id form=api.feedbackfruits.com/v1/lti/launch:authenticity_token,id_token,lti_storage_target,state,utf8
+launch POST api.feedbackfruits.com/v1/lti/launch 307 fields=authenticity_token,id_token,lti_storage_target,state,utf8
+launch POST api.eu.feedbackfruits.com/v1/lti/launch 302 fields=authenticity_token,id_token,lti_storage_target,state,utf8 cookies=access_token,refresh_token
+launch GET eu.feedbackfruits.com/courses/lti%2Fcourse/{id}/activities/{id} 200 cookies=_feedbackfruits-api_session
+endpoint GET api.eu.feedbackfruits.com/v1/activities/{id} 200 types=activities
+endpoint GET api.eu.feedbackfruits.com/v1/courses/{id}/appearances 200 query=include types=appearances
+endpoint GET api.eu.feedbackfruits.com/v1/institutions/{id} 200 types=institutions
+endpoint GET api.eu.feedbackfruits.com/v1/lti/courses/{id} 200 types=lti/course
+endpoint GET api.eu.feedbackfruits.com/v1/lti/environments/{id} 200 types=lti/environment
+endpoint GET api.eu.feedbackfruits.com/v1/multimedia/materials/{id} 200 types=multimedia/material
+endpoint GET api.eu.feedbackfruits.com/v1/multimedia/materials/{id}/questions 200 types=
+endpoint GET api.eu.feedbackfruits.com/v1/notifications 200 query=activity_id,include,page[number],page[size] types=
+endpoint GET api.eu.feedbackfruits.com/v1/progresses 200 query=activity_id,page[number] types=progresses
+endpoint GET api.eu.feedbackfruits.com/v1/progresses 200 query=filter[actor_type],filter[progressable_id],filter[progressable_type],page[number] types=progresses
+endpoint GET api.eu.feedbackfruits.com/v1/progresses 200 query=filter[id] types=progresses
+endpoint GET api.eu.feedbackfruits.com/v1/progresses/{id} 200 types=progresses
+endpoint GET api.eu.feedbackfruits.com/v1/tasks/{id} 200 types=instruct-tasks
+endpoint GET api.eu.feedbackfruits.com/v1/tasks/{id} 200 types=multimedia-tasks
+endpoint GET api.eu.feedbackfruits.com/v1/tasks/{id} 200 types=summative-grade-tasks
+endpoint GET api.eu.feedbackfruits.com/v1/tasks/{id}/grade_facets 200 types=
+endpoint GET api.eu.feedbackfruits.com/v1/users 200 query=filter[id] types=users
+endpoint GET api.eu.feedbackfruits.com/v1/users/current 200 types=users
+endpoint GET media.eu.feedbackfruits.com/{id} 200 keys=category,generativeContent,id,meta,metadata,name,type
+type activities attribute code
+type activities attribute comments-count
+type activities attribute created-at
+type activities attribute description
+type activities attribute has-keyword-insights
+type activities attribute is-implemented
+type activities attribute kind
+type activities attribute legacy-tool
+type activities attribute order
+type activities attribute published-at
+type activities attribute submitted-for-share
+type activities attribute title
+type activities attribute tool
+type activities attribute updated-at
+type activities attribute upvoted
+type activities attribute upvotes-count
+type activities attribute viewed
+type activities attribute views-count
+type activities relationship comments
+type activities relationship course
+type activities relationship flags
+type activities relationship folder
+type activities relationship group-set
+type activities relationship latest-template
+type activities relationship note
+type activities relationship placement
+type activities relationship progress
+type activities relationship tasks
+type activities relationship upvotes
+type activities relationship user
+type activities relationship views
+type appearances attribute action
+type appearances attribute created-at
+type appearances attribute expired-at
+type appearances attribute updated-at
+type appearances relationship appearable
+type appearances relationship course
+type appearances relationship user
+type emails attribute address
+type emails attribute primary
+type emails attribute verified
+type emails relationship user
+type institutions attribute name
+type institutions relationship environments
+type instruct-tasks attribute attachments-count
+type instruct-tasks attribute created-at
+type instruct-tasks attribute deadline-calendar-event-sync-completed-at
+type instruct-tasks attribute deadline-calendar-event-sync-scheduled-at
+type instruct-tasks attribute deadline-calendar-event-sync-started-at
+type instruct-tasks attribute description
+type instruct-tasks attribute description-rendered
+type instruct-tasks attribute order
+type instruct-tasks attribute title
+type instruct-tasks attribute type
+type instruct-tasks relationship activity
+type instruct-tasks relationship attachments
+type instruct-tasks relationship course
+type instruct-tasks relationship grade-facets
+type instruct-tasks relationship note
+type instruct-tasks relationship progress
+type instruct-tasks relationship progresses
+type lti/course attribute code
+type lti/course attribute created-at
+type lti/course attribute enrollability
+type lti/course attribute enrolled
+type lti/course attribute enrollments-sync-completed-at
+type lti/course attribute enrollments-sync-count
+type lti/course attribute enrollments-sync-counted-at
+type lti/course attribute enrollments-sync-failed-at
+type lti/course attribute enrollments-sync-scheduled-at
+type lti/course attribute enrollments-sync-started-at
+type lti/course attribute external-id
+type lti/course attribute groups-sync-completed-at
+type lti/course attribute groups-sync-count
+type lti/course attribute groups-sync-counted-at
+type lti/course attribute groups-sync-failed-at
+type lti/course attribute groups-sync-scheduled-at
+type lti/course attribute groups-sync-started-at
+type lti/course attribute memberships-sync-completed-at
+type lti/course attribute memberships-sync-count
+type lti/course attribute memberships-sync-counted-at
+type lti/course attribute memberships-sync-failed-at
+type lti/course attribute memberships-sync-scheduled-at
+type lti/course attribute memberships-sync-started-at
+type lti/course attribute name
+type lti/course attribute participants-count
+type lti/course attribute role
+type lti/course relationship admin-enrollments
+type lti/course relationship admins
+type lti/course relationship appearances
+type lti/course relationship enrollments
+type lti/course relationship environment
+type lti/course relationship group-sets
+type lti/course relationship invitations
+type lti/course relationship progress
+type lti/course relationship teaching-assistants
+type lti/environment attribute created-at
+type lti/environment attribute deployment-id
+type lti/environment attribute hubspot-id
+type lti/environment attribute identity-provider
+type lti/environment attribute integrable
+type lti/environment attribute integration-status
+type lti/environment attribute launched-at
+type lti/environment attribute lms-type
+type lti/environment attribute marketing
+type lti/environment attribute name
+type lti/environment attribute oauthable
+type lti/environment attribute pilot
+type lti/environment attribute plagiarism-check-available
+type lti/environment attribute role
+type lti/environment attribute settings
+type lti/environment attribute turnitin-eula-required
+type lti/environment attribute url
+type lti/environment relationship institution
+type lti/environment relationship template-course
+type lti/environment relationship template-courses
+type multimedia-tasks attribute allow-comments
+type multimedia-tasks attribute allow-non-admin-questions-show-peers-answers
+type multimedia-tasks attribute allow-questions
+type multimedia-tasks attribute comments-facet-amount
+type multimedia-tasks attribute comments-facet-weight
+type multimedia-tasks attribute contributors-anonymous
+type multimedia-tasks attribute created-at
+type multimedia-tasks attribute deadline-at
+type multimedia-tasks attribute deadline-calendar-event-sync-completed-at
+type multimedia-tasks attribute deadline-calendar-event-sync-scheduled-at
+type multimedia-tasks attribute deadline-calendar-event-sync-started-at
+type multimedia-tasks attribute deadline-explicit
+type multimedia-tasks attribute discussions-completed-facet-weight
+type multimedia-tasks attribute discussions-facet-amount
+type multimedia-tasks attribute discussions-facet-weight
+type multimedia-tasks attribute order
+type multimedia-tasks attribute pseudonym-seed
+type multimedia-tasks attribute questions-completed-facet-weight
+type multimedia-tasks attribute questions-facet-amount
+type multimedia-tasks attribute questions-facet-weight
+type multimedia-tasks attribute start-at
+type multimedia-tasks attribute start-explicit
+type multimedia-tasks attribute title
+type multimedia-tasks attribute type
+type multimedia-tasks attribute viewed-facet-weight
+type multimedia-tasks attribute within-group
+type multimedia-tasks relationship activity
+type multimedia-tasks relationship course
+type multimedia-tasks relationship deadline-extensions
+type multimedia-tasks relationship grade-facets
+type multimedia-tasks relationship material
+type multimedia-tasks relationship note
+type multimedia-tasks relationship progress
+type multimedia-tasks relationship progresses
+type multimedia/material attribute category
+type multimedia/material attribute copyrighted
+type multimedia/material attribute created-at
+type multimedia/material attribute custom-media-alternatives-count
+type multimedia/material attribute disable-subtitles
+type multimedia/material attribute updated-at
+type multimedia/material attribute viewed
+type multimedia/material attribute views-count
+type multimedia/material relationship annotations
+type multimedia/material relationship audio-descriptions
+type multimedia/material relationship comments
+type multimedia/material relationship discussion-review-tasks
+type multimedia/material relationship fragments
+type multimedia/material relationship media
+type multimedia/material relationship questions
+type multimedia/material relationship subtitles
+type multimedia/material relationship task
+type multimedia/material relationship text-descriptions
+type multimedia/material relationship user
+type multimedia/material relationship views
+type progresses attribute grades
+type progresses attribute grades-published-at
+type progresses attribute metadata
+type progresses attribute progress
+type progresses attribute viewed
+type progresses relationship actor
+type progresses relationship latest-grade
+type progresses relationship latest-relevant-grade
+type progresses relationship progressable
+type summative-grade-tasks attribute appearance-for-grade-required
+type summative-grade-tasks attribute auto-publish-grades
+type summative-grade-tasks attribute created-at
+type summative-grade-tasks attribute deadline-calendar-event-sync-completed-at
+type summative-grade-tasks attribute deadline-calendar-event-sync-scheduled-at
+type summative-grade-tasks attribute deadline-calendar-event-sync-started-at
+type summative-grade-tasks attribute grades-published-at
+type summative-grade-tasks attribute group-effort-factor
+type summative-grade-tasks attribute order
+type summative-grade-tasks attribute pass-fail-grade
+type summative-grade-tasks attribute pass-fail-threshold
+type summative-grade-tasks attribute schedule-grades-published-at
+type summative-grade-tasks attribute title
+type summative-grade-tasks attribute type
+type summative-grade-tasks relationship activity
+type summative-grade-tasks relationship course
+type summative-grade-tasks relationship grade-facets
+type summative-grade-tasks relationship note
+type summative-grade-tasks relationship progress
+type summative-grade-tasks relationship progresses
+type users attribute bot
+type users attribute created-at
+type users attribute name
+type users attribute preferences
+type users attribute preview
+type users attribute turnitin-eula-accepted
+type users attribute zendesk-hash
+type users relationship account
+type users relationship emails
+type users relationship environments
+type users relationship media
+type users relationship template-course
+type users relationship template-courses

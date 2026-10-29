@@ -1,0 +1,712 @@
+\chapter{Detecting changes with HAR files}
+\label{HAR}
+
+FBF's API is private.
+FBF changes it when their web app needs a change, and nobody tells us; the
+same goes for the launch, which depends on Canvas too.
+An earlier attempt at this package shows how quickly that bites: a year on,
+its authentication no longer matched the API, and some attribute names it
+documented had never matched it.
+So we plan for change.
+This chapter gives us a way to see \emph{what} changed, using nothing but a
+browser.
+
+\section{The idea: compare shapes, not values}
+
+A browser can save everything it sends and receives as a HAR file (HTTP
+Archive): open the developer tools, open the FBF assignment, save.
+A HAR shows exactly what the web app does today, so comparing a fresh HAR
+with an old one shows what changed.
+But we cannot keep HAR files around, let alone commit them: they hold live
+session cookies and tokens, and the names and texts of students.
+
+What changes in an API, though, is its \emph{shape}: the hops of the launch,
+the endpoints, the form fields and cookies, the resource types with their
+attribute and relationship names.
+Values change every day without breaking anything; a renamed attribute
+breaks us however its values look.
+So we reduce a HAR to its shape, which holds names only and no values, and
+compare shapes.
+The shape of a known-good capture is committed as
+[[doc/fbf-api-shape.txt]], and [[fbf har-diff]] compares a fresh capture with
+it.
+
+A shape is a text file of one record per line, which keeps it readable and
+lets [[git diff]] show its history.
+For example:
+\begin{verbatim}
+launch POST api.feedbackfruits.com/v1/lti/login 307 fields=client_id,...
+endpoint GET api.eu.feedbackfruits.com/v1/tasks/{id} 200 types=...
+type multimedia-tasks attribute deadline-at
+type multimedia-tasks relationship progresses
+\end{verbatim}
+The [[launch]] records keep the order of the requests, since the order of
+the hops matters; the other records are sorted.
+
+<<[[har.py]]>>=
+"""Reduce HAR captures of FeedbackFruits to their shape and compare them."""
+
+<<imports>>
+
+<<constants>>
+
+<<functions>>
+@
+
+<<test [[har.py]]>>=
+from fbf.har import *
+
+<<test functions>>
+@
+
+
+\section{Which requests count}
+
+A HAR of opening an FBF assignment has a few hundred entries: scripts,
+fonts, images, analytics, a help-desk widget.
+Only two kinds of entries matter to us.
+\begin{description}
+\item[Launch hops] are the page loads and form posts on Canvas and on FBF:
+  what the browser \emph{navigates} to, in the page or in the tool's
+  iframe.
+  Browsers mark those requests with the header [[Sec-Fetch-Mode: navigate]],
+  while an image or a script is fetched in another mode.
+  A HAR without that header (an old browser) leaves us a guess: redirects and
+  HTML responses.
+  The guess admits a redirecting image now and then, which only adds noise.
+  A path under [[/lti/]] is no sign of a hop, since FBF's API has JSON
+  endpoints such as [[/v1/lti/courses/<id>]] too.
+\item[API calls] are JSON responses from an FBF host.
+\end{description}
+Everything else we skip.
+We recognise FBF by its domain and Canvas by the host of the first entry,
+which is the Canvas page the capture started on.
+CORS preflight requests ([[OPTIONS]]) carry no information of their own, so
+we skip those too.
+
+<<constants>>=
+FBF_DOMAIN = "feedbackfruits.com"
+<<functions>>=
+def is_fbf_host(host):
+    """Tell whether `host` belongs to FeedbackFruits."""
+    return host == FBF_DOMAIN or host.endswith("." + FBF_DOMAIN)
+
+
+def mime_type(entry):
+    """Return the MIME type of the response of a HAR `entry`, lowercase."""
+    mime = entry["response"].get("content", {}).get("mimeType") or ""
+    return mime.split(";")[0].strip().lower()
+
+
+def is_launch_hop(entry, canvas_host):
+    """Tell whether a HAR `entry` is a page load or form post of the launch."""
+    request = entry["request"]
+    host = urllib.parse.urlsplit(request["url"]).hostname or ""
+    if request["method"] not in ("GET", "POST"):
+        return False
+    if not (is_fbf_host(host) or host == canvas_host):
+        return False
+    mode = request_header(entry, "sec-fetch-mode")
+    if mode:
+        return mode == "navigate"
+    status = entry["response"]["status"]
+    return 300 <= status < 400 or mime_type(entry) == "text/html"
+
+
+def request_header(entry, name):
+    """Return the request header `name` (lowercase) of a HAR `entry`."""
+    return next((header["value"] for header
+                 in entry["request"].get("headers", [])
+                 if header["name"].lower() == name), None)
+
+
+def is_api_call(entry):
+    """Tell whether a HAR `entry` is a JSON response from an FBF host."""
+    request = entry["request"]
+    host = urllib.parse.urlsplit(request["url"]).hostname or ""
+    return (request["method"] != "OPTIONS" and is_fbf_host(host)
+            and mime_type(entry).endswith("json"))
+@
+
+
+\section{Paths without identifiers}
+
+The same endpoint appears with a different id in every request:
+[[/v1/tasks/63d1...]] and [[/v1/tasks/1322...]] are one endpoint.
+So we replace the identifying segments of a path by placeholders: UUIDs by
+[[{id}]], numbers (Canvas ids) by [[{n}]], long hexadecimal strings by
+[[{hex}]].
+Any other segment that does not look like a fixed word becomes [[{x}]].
+A fixed word is lowercase and short, like the words in FBF's and Canvas's
+paths; a random token such as Canvas's thumbnail keys mixes cases.
+That last rule is a privacy guard as much as a normalisation: whatever odd
+value ends up in a path, a name or an email, it never reaches the shape.
+
+<<imports>>=
+import re
+import urllib.parse
+<<constants>>=
+SEGMENT_PATTERNS = [
+    (re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
+                re.IGNORECASE), "{id}"),
+    (re.compile(r"[0-9]+"), "{n}"),
+    (re.compile(r"[0-9a-f]{16,}", re.IGNORECASE), "{hex}"),
+]
+FIXED_SEGMENT = re.compile(r"[a-z][a-z0-9_.-]{0,39}")
+<<functions>>=
+def template_segment(segment):
+    """Return a path segment with its identifier replaced by a placeholder."""
+    decoded = urllib.parse.unquote(segment)
+    for pattern, placeholder in SEGMENT_PATTERNS:
+        if pattern.fullmatch(decoded):
+            return placeholder
+    if "/" in decoded:
+        return urllib.parse.quote(
+            "/".join(template_segment(part) for part in decoded.split("/")),
+            safe="{}")
+    return segment if FIXED_SEGMENT.fullmatch(decoded) else "{x}"
+
+
+def template_url(url):
+    """Return `host/path` of `url` with identifiers replaced."""
+    parts = urllib.parse.urlsplit(url)
+    path = "/".join(template_segment(s) if s else s
+                    for s in parts.path.split("/"))
+    return f"{parts.hostname}{path}"
+@
+
+FBF's course path contains an encoded slash, [[lti%2Fcourse]], which we
+keep: it is a fixed word, not an identifier.
+
+<<test functions>>=
+UUID1 = "63d138a7-e4f3-4950-8ea4-0b03add5dd9a"
+
+def test_template_url_replaces_identifiers():
+  assert template_url(f"https://api.example.com/v1/tasks/{UUID1}/progresses") \
+    == "api.example.com/v1/tasks/{id}/progresses"
+  assert template_url("https://canvas.example.com/courses/63874/assignments/1") \
+    == "canvas.example.com/courses/{n}/assignments/{n}"
+  assert template_url(f"https://eu.example.com/courses/lti%2Fcourse/{UUID1}") \
+    == "eu.example.com/courses/lti%2Fcourse/{id}"
+
+def test_template_url_hides_odd_segments():
+  assert template_url("https://x.example.com/people/alice@example.com") \
+    == "x.example.com/people/{x}"
+  assert template_url("https://x.example.com/v1/" + "ab12" * 8) \
+    == "x.example.com/v1/{hex}"
+  assert template_url("https://x.example.com/thumbnails/1/HCZFs5GRoRvQv") \
+    == "x.example.com/thumbnails/{n}/{x}"
+@
+
+
+\section{The shape of one entry}
+
+For each kind of entry we keep the names that our code depends on.
+
+\subsection{Launch hops}
+
+A hop is the request (method, templated URL), the status, the names of the
+posted form fields, the names of the cookies the response sets, and the
+forms in the response with their actions and field names.
+The fields of the forms in the response are what the next hop posts, so
+they are what [[fbf.launch]] looks for.
+
+<<functions>>=
+def launch_record(entry):
+    """Return the shape record of a launch hop."""
+    request, response = entry["request"], entry["response"]
+    record = (f"launch {request['method']} {template_url(request['url'])} "
+              f"{response['status']}")
+    fields = sorted({p["name"] for p in
+                     (request.get("postData") or {}).get("params", [])})
+    if fields:
+        record += " fields=" + ",".join(fields)
+    cookies = sorted(set_cookie_names(response))
+    if cookies:
+        record += " cookies=" + ",".join(cookies)
+    for form in response_forms(response):
+        record += (f" form={template_url(form.action)}:"
+                   + ",".join(sorted(form.fields)))
+    return record
+@
+
+A cookie's name is the part of a [[Set-Cookie]] header before the first
+[[=]]; the value and attributes after it are not ours to keep.
+
+<<functions>>=
+def set_cookie_names(response):
+    """Return the names of the cookies a HAR `response` sets."""
+    return {header["value"].split("=", 1)[0].strip()
+            for header in response.get("headers", [])
+            if header["name"].lower() == "set-cookie"}
+@
+
+The forms come from the same parser as the launch uses, so the shape sees
+the forms the way our code sees them.
+A relative action is resolved against nothing, which leaves its path; that
+is good enough for a shape.
+
+<<imports>>=
+from fbf.launch import parse_page
+<<functions>>=
+def response_forms(response):
+    """Return the forms with an action in the HTML of a HAR `response`."""
+    content = response.get("content", {})
+    if not (content.get("mimeType") or "").startswith("text/html"):
+        return []
+    return [form for form in parse_page(content.get("text") or "").forms
+            if form.action.startswith("http")]
+@
+
+\subsection{API calls}
+
+An API call is keyed by method and templated URL.
+We record the names of the query parameters, the status, and what came back:
+the types in [[data]] for a JSON:API document, the top-level keys for any
+other JSON.
+The types in [[included]] depend on the [[include]] parameter, which the
+query names already show.
+The resources themselves, in [[data]] and [[included]], each give us type
+records with their attribute and relationship names.
+
+<<imports>>=
+import json
+<<functions>>=
+def api_records(entry):
+    """Return the endpoint record and the type records of an API call."""
+    request, response = entry["request"], entry["response"]
+    query = sorted({p["name"] for p in request.get("queryString", [])})
+    record = (f"endpoint {request['method']} {template_url(request['url'])} "
+              f"{response['status']}")
+    if query:
+        record += " query=" + ",".join(query)
+    try:
+        body = json.loads(response.get("content", {}).get("text") or "")
+    except ValueError:
+        return [record], []
+    if not isinstance(body, dict):
+        return [record], []
+    resources = jsonapi_resources(body)
+    if "data" in body:
+        types = sorted({resource["type"] for resource
+                        in jsonapi_resources({"data": body["data"]})})
+        record += " types=" + ",".join(types)
+    else:
+        record += " keys=" + ",".join(sorted(body))
+    return [record], [line for resource in resources
+                      for line in type_records(resource)]
+@
+
+The resources of a document are those in [[data]], one or a list, and those
+in [[included]].
+
+<<functions>>=
+def jsonapi_resources(document):
+    """Return all resources in the `data` and `included` of `document`."""
+    data = document.get("data")
+    data = data if isinstance(data, list) else [data] if data else []
+    return [resource for resource in data + document.get("included", [])
+            if isinstance(resource, dict) and "type" in resource]
+
+
+def type_records(resource):
+    """Return the type records for the names in a JSON:API `resource`."""
+    kind = resource["type"]
+    return ([f"type {kind} attribute {name}"
+             for name in resource.get("attributes") or {}]
+            + [f"type {kind} relationship {name}"
+               for name in resource.get("relationships") or {}])
+@
+
+
+\section{The shape of a capture}
+
+The shape of a HAR is its launch records in order, followed by the sorted,
+unique endpoint and type records.
+An endpoint called several times may have answered with different statuses
+or types; we keep one record per distinct answer, which shows such variation
+instead of hiding it.
+
+We accept several HAR files and unite their shapes, because one capture
+rarely visits every view.
+The reference shape grows by adding captures of new views.
+The launch, however, is the same in every capture, so we take it from the
+first capture that has one.
+
+<<functions>>=
+def har_shape(hars):
+    """Return the shape (list of records) of the HAR documents `hars`."""
+    launch, endpoints, types = [], set(), set()
+    for har in hars:
+        entries = har["log"]["entries"]
+        canvas_host = (urllib.parse.urlsplit(entries[0]["request"]["url"])
+                       .hostname if entries else None)
+        hops = [launch_record(entry) for entry in entries
+                if is_launch_hop(entry, canvas_host)]
+        launch = launch or hops
+        for entry in entries:
+            if is_api_call(entry):
+                endpoint_lines, type_lines = api_records(entry)
+                endpoints.update(endpoint_lines)
+                types.update(type_lines)
+    return launch + sorted(endpoints) + sorted(types)
+@
+
+A test HAR needs only a few entries to cover the selection: a Canvas page
+with the tool form, an FBF redirect setting a cookie, an API call with an
+included resource, and the noise we skip.
+The values in it, a student's name and a cookie value, let us check that no
+value reaches the shape.
+
+<<test functions>>=
+def har_entry(method, url, status, mime="", text="", headers=(),
+              params=(), query=(), mode=None):
+  return {"request": {"method": method, "url": url,
+                      "headers": [{"name": "Sec-Fetch-Mode", "value": mode}]
+                                 if mode else [],
+                      "postData": {"params": [{"name": n, "value": "v"}
+                                              for n in params]},
+                      "queryString": [{"name": n, "value": "v"}
+                                      for n in query]},
+          "response": {"status": status, "headers": list(headers),
+                       "content": {"mimeType": mime, "text": text}}}
+
+SECRET = "s3cr3t-cookie-value"
+STUDENT = "Alice Studentsson"
+
+def sample_har(attribute="title"):
+  task = {"type": "tasks", "id": UUID1,
+          "attributes": {attribute: "Week 1"},
+          "relationships": {"user": {"data": {"type": "users", "id": "u"}}}}
+  user = {"type": "users", "id": "u", "attributes": {"name": STUDENT}}
+  return {"log": {"entries": [
+    har_entry("GET", "https://canvas.example.com/courses/1/assignments/2",
+              200, "text/html",
+              '<form action="https://api.feedbackfruits.com/v1/lti/login"'
+              ' method="POST"><input name="login_hint" value="x"></form>'),
+    har_entry("POST", "https://api.feedbackfruits.com/v1/lti/login", 302,
+              params=["login_hint"],
+              headers=[{"name": "Set-Cookie",
+                        "value": f"lti_cookie_probe={SECRET}; secure"}]),
+    har_entry("GET", "https://cdn.example.com/app.js", 200,
+              "application/javascript"),
+    har_entry("OPTIONS", f"https://api.feedbackfruits.com/v1/tasks/{UUID1}",
+              200),
+    har_entry("GET", f"https://api.feedbackfruits.com/v1/tasks/{UUID1}",
+              200, "application/json; charset=utf-8",
+              json.dumps({"data": task, "included": [user]}),
+              query=["include"]),
+  ]}}
+
+def test_har_shape_keeps_launch_endpoints_and_types():
+  assert har_shape([sample_har()]) == [
+    "launch GET canvas.example.com/courses/{n}/assignments/{n} 200"
+    " form=api.feedbackfruits.com/v1/lti/login:login_hint",
+    "launch POST api.feedbackfruits.com/v1/lti/login 302"
+    " fields=login_hint cookies=lti_cookie_probe",
+    "endpoint GET api.feedbackfruits.com/v1/tasks/{id} 200 query=include"
+    " types=tasks",
+    "type tasks attribute title",
+    "type tasks relationship user",
+    "type users attribute name",
+  ]
+
+def test_har_shape_skips_redirecting_images():
+  image = har_entry("GET", "https://canvas.example.com/images/thumbnails/1/x",
+                    302, mode="no-cors")
+  page = har_entry("GET", "https://canvas.example.com/courses/1", 200,
+                   "text/html", mode="navigate")
+  assert har_shape([{"log": {"entries": [page, image]}}]) \
+    == ["launch GET canvas.example.com/courses/{n} 200"]
+
+def test_har_shape_holds_no_values():
+  shape = "\n".join(har_shape([sample_har()]))
+  assert SECRET not in shape and STUDENT not in shape and UUID1 not in shape
+@
+
+
+\section{Comparing shapes}
+
+A new capture is compared with the reference shape.
+Not every difference means trouble: a capture that did not open the
+peer-review view lacks the peer-review endpoints, yet nothing changed.
+So we sort the differences by what they tell us.
+\begin{description}
+\item[Changed launch.] Any difference in the launch records, since every
+  launch goes through the same hops.
+\item[Removed.] A type or endpoint seen in both captures that lost an
+  attribute, a relationship or a status.
+  This is what breaks code.
+\item[Added.] Names that are new for a type or endpoint seen in both.
+  Usually harmless, and sometimes the replacement of a removed name.
+\item[Not seen, new.] Types and endpoints only in one of the shapes.
+  Either a view that one capture did not visit, or a rename; the removed
+  and added lists of the same capture tell which.
+\end{description}
+The launch is compared as a sequence, with [[difflib]], since an inserted
+redirect shifts all later hops.
+Types are compared per name: we group the type records by type and compare
+the sets of names.
+
+<<imports>>=
+import collections
+import difflib
+<<functions>>=
+def group_records(records, kind):
+    """Group the `kind` records by their key (type or endpoint).
+
+    Type records are grouped by type name, with the attribute and
+    relationship names as members.  Endpoint records are grouped by method
+    and URL, with the rest of the record as members.
+    """
+    groups = collections.defaultdict(set)
+    for record in records:
+        if not record.startswith(kind + " "):
+            continue
+        words = record.split(" ")
+        if kind == "type":
+            groups[words[1]].add(" ".join(words[2:]))
+        else:
+            groups[" ".join(words[1:3])].add(" ".join(words[3:]))
+    return groups
+@
+
+The comparison returns a dictionary of the four kinds of differences, each a
+list of lines, so that the command can print them and the tests can check
+them.
+
+<<functions>>=
+def shape_diff(reference, current):
+    """Compare two shapes; return the differences sorted by kind."""
+    diff = {"launch": [], "removed": [], "added": [],
+            "not seen": [], "new": []}
+    old_launch = [r for r in reference if r.startswith("launch ")]
+    new_launch = [r for r in current if r.startswith("launch ")]
+    if old_launch and new_launch and old_launch != new_launch:
+        diff["launch"] = list(difflib.unified_diff(
+            old_launch, new_launch, "reference", "capture", lineterm="", n=0))
+    for kind in ("endpoint", "type"):
+        old = group_records(reference, kind)
+        new = group_records(current, kind)
+        for key in sorted(old.keys() | new.keys()):
+            if key not in new:
+                diff["not seen"].append(f"{kind} {key}")
+            elif key not in old:
+                diff["new"].append(f"{kind} {key}")
+            else:
+                diff["removed"] += [f"{kind} {key} {name}"
+                                    for name in sorted(old[key] - new[key])]
+                diff["added"] += [f"{kind} {key} {name}"
+                                  for name in sorted(new[key] - old[key])]
+    return diff
+@
+
+The test that matters most: a renamed attribute must show up as removed
+(and the new name as added), while a type the capture never saw must not.
+
+<<test functions>>=
+def test_shape_diff_flags_renamed_attribute():
+  reference = har_shape([sample_har("title")]) + ["type groups attribute name"]
+  diff = shape_diff(reference, har_shape([sample_har("name")]))
+  assert diff["removed"] == ["type tasks attribute title"]
+  assert diff["added"] == ["type tasks attribute name"]
+  assert diff["not seen"] == ["type groups"]
+  assert diff["launch"] == [] and diff["new"] == []
+
+def test_shape_diff_flags_changed_launch():
+  current = [r.replace(" 302", " 307") for r in har_shape([sample_har()])]
+  diff = shape_diff(har_shape([sample_har()]), current)
+  assert any(line.startswith("+launch POST") and "307" in line
+             for line in diff["launch"])
+@
+
+
+\section{Updating the reference}
+
+We cannot keep the HAR files, so the reference must be updated from its own
+records and a new capture.
+Uniting the two would be wrong: after a rename, the old name would stay in
+the reference, and every later diff would report it as removed.
+The new capture is the truth for what it saw, and the reference for what it
+did not see.
+So the update replaces the records of every type and endpoint the capture
+saw and keeps the others; the launch comes from the capture if it has one.
+
+<<functions>>=
+def merge_shapes(reference, current):
+    """Update the shape `reference` with what the shape `current` saw."""
+    launch = ([r for r in current if r.startswith("launch ")]
+              or [r for r in reference if r.startswith("launch ")])
+    seen = {kind: group_records(current, kind)
+            for kind in ("endpoint", "type")}
+    kept = [record for record in reference
+            if not record.startswith("launch ")
+            and not any(record.startswith(f"{kind} {key} ")
+                        for kind in seen for key in seen[kind])]
+    updated = [r for r in current if not r.startswith("launch ")]
+    endpoints = sorted({r for r in kept + updated if r.startswith("endpoint ")})
+    types = sorted({r for r in kept + updated if r.startswith("type ")})
+    return launch + endpoints + types
+@
+
+The update must drop a renamed attribute and keep a type the capture never
+saw.
+
+<<test functions>>=
+def test_merge_shapes_replaces_seen_and_keeps_unseen():
+  reference = har_shape([sample_har("title")]) + ["type groups attribute name"]
+  merged = merge_shapes(reference, har_shape([sample_har("name")]))
+  assert "type tasks attribute name" in merged
+  assert "type tasks attribute title" not in merged
+  assert "type groups attribute name" in merged
+  current = har_shape([sample_har("name")])
+  assert merged[:3] == current[:3]
+  assert merged[3:] == sorted(current[3:] + ["type groups attribute name"])
+@
+
+
+\section{The commands}
+
+Two commands make this usable from the shell.
+[[fbf har-shape]] prints the shape of one or more HAR files.
+With [[--update]] it instead merges them into the reference file as above,
+which is how the reference follows FBF.
+Redirecting its output to [[doc/fbf-api-shape.txt]] starts a new
+reference.
+[[fbf har-diff]] compares a HAR with the reference.
+It exits with status~1 when the launch changed or something was removed,
+so that it can guard a script.
+
+Both work without Canvas, and their arguments are files, so they follow the
+command convention of [[canvaslms]], [[(config, canvas, args)]], and ignore
+the first two.
+That lets the [[fbf]] command and, later, [[canvaslms]] register them as
+subcommands unchanged.
+
+<<imports>>=
+import pathlib
+import sys
+<<constants>>=
+REFERENCE_SHAPE = "doc/fbf-api-shape.txt"
+SHAPE_HEADER = """\
+# The shape of FeedbackFruits' launch and API, made by `fbf har-shape`.
+# Names only, no values.  Compare a fresh capture with `fbf har-diff`.
+"""
+<<functions>>=
+def read_hars(paths):
+    """Return the HAR documents in the files `paths`."""
+    return [json.loads(pathlib.Path(path).read_text(encoding="utf-8"))
+            for path in paths]
+
+
+def read_shape(path):
+    """Return the records of a shape file, without comments."""
+    return [line for line in
+            pathlib.Path(path).read_text(encoding="utf-8").splitlines()
+            if line and not line.startswith("#")]
+
+
+def har_shape_command(config, canvas, args):
+    """Print the shape of `args.har`, or merge it into `args.update`."""
+    shape = har_shape(read_hars(args.har))
+    if args.update:
+        shape = merge_shapes(read_shape(args.update), shape)
+        pathlib.Path(args.update).write_text(
+            SHAPE_HEADER + "\n".join(shape) + "\n", encoding="utf-8")
+    else:
+        print(SHAPE_HEADER + "\n".join(shape))
+
+
+def har_diff_command(config, canvas, args):
+    """Compare the HAR files `args.har` with the shape `args.reference`."""
+    diff = shape_diff(read_shape(args.reference),
+                      har_shape(read_hars(args.har)))
+    for kind, lines in diff.items():
+        if lines:
+            print(f"{kind}:")
+            print("\n".join(f"  {line}" for line in lines))
+    if diff["launch"] or diff["removed"]:
+        sys.exit(1)
+@
+
+The arguments are registered by a function of their own, so that the
+standalone command and [[canvaslms]] share them.
+
+<<functions>>=
+def add_command(subp):
+    """Add the `har-shape` and `har-diff` commands to `subp`."""
+    shape_parser = subp.add_parser(
+        "har-shape", help="Print the shape (names, no values) of HAR files")
+    shape_parser.add_argument("har", nargs="+", help="HAR file(s)")
+    shape_parser.add_argument(
+        "-u", "--update", metavar="SHAPE", nargs="?", const=REFERENCE_SHAPE,
+        help="merge into this shape file instead of printing, "
+             f"default {REFERENCE_SHAPE}")
+    shape_parser.set_defaults(func=har_shape_command)
+
+    diff_parser = subp.add_parser(
+        "har-diff", help="Compare a HAR capture with the reference shape")
+    diff_parser.add_argument("har", nargs="+", help="HAR file(s)")
+    diff_parser.add_argument(
+        "-r", "--reference", default=REFERENCE_SHAPE,
+        help=f"reference shape file, default {REFERENCE_SHAPE}")
+    diff_parser.set_defaults(func=har_diff_command)
+@
+
+
+\section{When FeedbackFruits changes: the procedure}
+\label{Recovery}
+
+This section is the procedure to follow when the package breaks, and also
+when we want data from a view we have never extracted.
+Both start the same way: look at what the web app does today.
+
+\begin{enumerate}
+\item\label{RecoverySymptom}
+  \textbf{Notice.}
+  The signs of change are a [[LaunchError]] (it names the hop), an
+  [[APIError]] or a missing attribute in an extractor, or a drift report from
+  the live tests.
+  For a new extractor, the sign is simply that we want data we do not have.
+
+\item\label{RecoveryCapture}
+  \textbf{Capture.}
+  In Firefox (or Chrome), open the developer tools and their Network tab.
+  Enable \enquote{Persist Logs} (Chrome: \enquote{Preserve log}), so that
+  the redirects of the launch stay in the list, and \enquote{Disable Cache},
+  so that every response is captured with its content.
+  Then open the FBF assignment from its Canvas module, as the reference
+  capture did, and click through the views whose data we need: the results
+  overview, a student's received and given reviews, the comments.
+  Finally save everything: right-click in the list, \enquote{Save All As
+  HAR}.
+  Save the file outside the repository, in [[~/private/fbf-hars/]], named by
+  date and view.
+  The repository's [[.gitignore]] refuses [[*.har]] as a second guard.
+
+\item\label{RecoveryDiagnose}
+  \textbf{Diagnose.}
+  Run [[fbf har-diff ~/private/fbf-hars/<file>.har]] in the repository.
+  The launch differences say which hop changed; the removed and added names
+  say what was renamed; the new endpoints and types are where to look for
+  new data.
+  To see values, which the shape leaves out, open the HAR in the browser's
+  network tab rather than printing it: the HAR is full of personal data.
+
+\item\label{RecoveryFix}
+  \textbf{Fix.}
+  Change the launch (\cref{Launch}) or the extractors to match.
+  Re-record the affected tests and review the recordings' diff, then run the
+  privacy scan on them.
+  Update the reference with [[fbf har-shape --update <file>.har]], which
+  replaces what the capture saw and keeps the views it did not visit.
+  Commit the code, the shape and the recordings together, so that the
+  history shows what FBF changed and how we followed.
+
+\item\label{RecoveryCleanUp}
+  \textbf{Clean up.}
+  The HAR holds live session cookies: a Canvas session and an FBF refresh
+  token that is valid for 14~days.
+  Log out of Canvas and FBF to end those sessions, and delete the HAR when
+  the fix is committed.
+\end{enumerate}

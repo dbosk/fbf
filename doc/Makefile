@@ -5,6 +5,7 @@ fbf.pdf: preamble.tex
 fbf.pdf: ../src/fbf/init.tex
 fbf.pdf: ../src/fbf/launch.tex
 fbf.pdf: ../src/fbf/api.tex
+fbf.pdf: ../src/fbf/har.tex
 
 # The woven .tex files need their .nw as prerequisite for an edited source
 # to trigger a re-weave.
