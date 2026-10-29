@@ -161,3 +161,6 @@ cython_debug/
 
 # Browser captures contain live session cookies and personal data
 *.har
+
+# Agent worktrees of Claude Code
+.claude/worktrees/
