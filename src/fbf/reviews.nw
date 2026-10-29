@@ -706,31 +706,57 @@ def allocation_users(fbf, allocations):
 @
 
 These functions talk to FBF, so their test needs a recording
-(\cref{Testing}).
-It checks what holds for any peer review on any day: every comment and
-every rating that the allocations count is in the result exactly once, and
-every score is the weight of an option.
+(\cref{Testing}); offline, the fake of \cref{fake-fbf} stands in.
+The recorded test checks what holds for any peer review on any day: every
+comment and every rating that the allocations count is in the result
+exactly once, a review has a level exactly when it has a score, and every
+level and score is the title and weight of one of the criteria's options.
 That fails if we skip allocations we should not, lose comments in the
 grouping, or read the levels from the wrong place.
-To keep the recording small it takes the peer review with the fewest
-allocations in the launched course.
+The last check is stricter than [[fetch_reviews]]: a rating whose option
+the rubric no longer lists would fail it.
+We have never seen one in FBF (all 540 ratings we checked chose a listed
+option), so a failure there means that this case has appeared, and the
+check should then learn to accept it.
+To keep the recording small it takes the smallest peer review in the
+launched course, counted in allocations, among those that have ratings,
+since one without would leave the levels unchecked.
+The recorded tests of the feedback and the reflections below choose their
+activity the same way.
 
 <<test functions>>=
 import conftest
 
+def smallest_peer_review(fbf, wanted):
+  """Return `(tasks, allocations)` of the smallest `wanted` peer review."""
+  found = []
+  for tasks in conftest.review_task_sets(fbf, fbf.login):
+    allocations = fbf.get(related_link(tasks[REVIEW_TASK],
+                                       "allocations")).resources
+    if wanted(tasks, allocations):
+      found.append((tasks, allocations))
+  assert found, "no such peer review in the launched course"
+  return min(found, key=lambda pair: len(pair[1]))
+
 @pytest.mark.vcr
 def test_fetch_reviews_accounts_for_every_comment_and_rating(fbf):
-  tasks = min(conftest.review_task_sets(fbf, fbf.login),
-              key=lambda tasks: len(fbf.get(related_link(
-                tasks[REVIEW_TASK], "allocations")).resources))
-  allocations = fbf.get(related_link(tasks[REVIEW_TASK],
-                                     "allocations")).resources
+  tasks, allocations = smallest_peer_review(
+    fbf, lambda tasks, allocations:
+      any(a["attributes"]["ratings-count"] for a in allocations))
   result = fetch_reviews(fbf, tasks, "Activity")
   assert sum(len(r.comments) for r in result) \
     == sum(a["attributes"]["reviews-count"] for a in allocations)
   assert sum(r.level != "" for r in result) \
     == sum(a["attributes"]["ratings-count"] for a in allocations)
-  assert all(r.score is None or isinstance(r.score, int) for r in result)
+  assert all((r.level == "") == (r.score is None) for r in result)
+  criteria = fbf.get(related_link(tasks[REVIEW_TASK], "criteria")).resources
+  options = fbf.get_by_ids(
+    "v1/assignments/criterion_options",
+    [o["id"] for c in criteria
+     for o in c["relationships"]["options"]["data"] or []])
+  levels = {(o["attributes"]["title"], o["attributes"]["weight"])
+            for o in options.values()}
+  assert all((r.level, r.score) in levels for r in result if r.level)
 @
 
 
@@ -813,6 +839,26 @@ def test_feedback_enabled_and_reviewed():
   assert not reviewed(allocation("a", reviews=0, ratings=0))
 @
 
+Against FBF, [[fetch_feedback]] must give one [[Feedback]] per reviewer
+feedback that exists, with both parties named.
+The test counts the feedback by asking every allocation of the activity,
+not only those with a review, so that it would notice if the skip in
+[[fetch_feedback]] lost some.
+
+<<test functions>>=
+@pytest.mark.vcr
+def test_fetch_feedback_gives_one_row_per_reviewer_feedback(fbf):
+  tasks, allocations = smallest_peer_review(
+    fbf, lambda tasks, allocations: feedback_enabled(tasks))
+  result = fetch_feedback(fbf, tasks, "Activity")
+  feedbacks = [f for document in fbf.get_many(
+                 [(related_link(a, "reviewer-feedback"), {})
+                  for a in allocations])
+               for f in document.resources]
+  assert len(result) == len(feedbacks)
+  assert all(f.reviewee and f.reviewer for f in result)
+@
+
 \section{Reflections}
 
 The reflections are one list behind the reflect task.
@@ -851,6 +897,21 @@ def test_make_reflections_reads_deltas_and_sorts_by_student():
                                       reflection("u2", "Fun\n")], USERS)
   assert [(r.student, r.body) for r in result] \
     == [("Ada", "Fun\n"), ("Cy", "Agreed")]
+@
+
+Against FBF, there must be one [[Reflection]] per reflection, each with
+its student's name.
+
+<<test functions>>=
+@pytest.mark.vcr
+def test_fetch_reflections_gives_one_named_row_per_reflection(fbf):
+  tasks, _ = smallest_peer_review(
+    fbf, lambda tasks, allocations: REFLECT_TASK in tasks)
+  result = fetch_reflections(fbf, tasks, "Activity")
+  reflections = fbf.get(related_link(tasks[REFLECT_TASK],
+                                     "reflections")).resources
+  assert len(result) == len(reflections)
+  assert all(r.student for r in result)
 @
 
 
