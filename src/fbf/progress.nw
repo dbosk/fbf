@@ -1313,19 +1313,19 @@ The multimedia task and the activity have fetchers there already.
 from fbf import progress as progress_module
 
 
-def progress_activities(fbf, launched):
+def progress_activities(fbf, login):
     """Yield the launched activity's id, then the others in its course."""
-    yield launched.activity_uuid
+    yield login.activity_uuid
     for activity in fbf.get(
-            f"v1/courses/{launched.course_uuid}/activities").resources:
-        if activity["id"] != launched.activity_uuid:
+            f"v1/courses/{login.course_uuid}/activities").resources:
+        if activity["id"] != login.activity_uuid:
             yield activity["id"]
 
 
-def progress_example(fbf, launched, kind, resources_of):
+def progress_example(fbf, login, kind, resources_of):
     """Return the first resource of `kind` among `resources_of` an
     activity."""
-    for activity in progress_activities(fbf, launched):
+    for activity in progress_activities(fbf, login):
         for resource in resources_of(fbf, activity):
             if resource["type"] == kind:
                 return resource
@@ -1339,26 +1339,31 @@ def progress_sent_grades(fbf, activity):
 
 
 @example("progresses")
-def progress_of_the_launched_activity(fbf, launched):
+def progress_of_the_launched_activity(fbf, login):
     return progress_module.activity_progresses(
-        fbf, launched.activity_uuid)[0]
+        fbf, login.activity_uuid)[0]
 
 
 @example("emails")
-def progress_email(fbf, launched):
-    progress = progress_of_the_launched_activity(fbf, launched)
+def progress_email(fbf, login):
+    progress = progress_of_the_launched_activity(fbf, login)
     actor = progress_module.related_id(progress, "actor")
     return fbf.get(f"v1/people/{actor}/emails").resources[0]
 
 
 @example("lti/grade")
-def progress_grade_sent(fbf, launched):
-    return progress_example(fbf, launched, "lti/grade",
+def progress_grade_sent(fbf, login):
+    return progress_example(fbf, login, "lti/grade",
                             progress_sent_grades)
 
 
-for kind in ["reflect-tasks", "annotate-tasks", "submit-tasks",
-             "submission-review-tasks", "submission-review-view-tasks"]:
-    example(kind)(lambda fbf, launched, kind=kind: progress_example(
-        fbf, launched, kind, progress_module.activity_tasks))
+for kind in ["annotate-tasks", "submit-tasks"]:
+    example(kind)(lambda fbf, login, kind=kind: progress_example(
+        fbf, login, kind, progress_module.activity_tasks))
 @
+
+The other task types whose weights we declare---[[reflect-tasks]],
+[[submission-review-tasks]] and [[submission-review-view-tasks]]---already
+have fetchers in \cref{Reviews}, and a type has one fetcher.
+That is enough: the contract test checks every name declared for a type,
+whichever chapter declared it, on the one example.
