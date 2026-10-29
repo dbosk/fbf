@@ -1,16 +1,27 @@
 [tool.poetry]
 name = "fbf"
 version = "0.1"
-description = "Programmatically interact with FeedbackFruits"
+description = "Extract detailed data from FeedbackFruits through its Canvas LTI launch"
 authors = ["Daniel Bosk <dbosk@kth.se>"]
+license = "MIT"
 readme = "README.md"
 packages = [{include = "fbf", from = "src"}]
+include = [
+  {path="src/**/*.py", format="wheel"},
+  {path="src/**/*.nw", format="sdist"},
+  {path="src/**/Makefile", format="sdist"},
+  {path="src/**/*.tex", format="sdist"}
+]
+exclude = [
+  {path="src/**/*.py", format="sdist"},
+  {path="src/**/*.nw", format="wheel"},
+  "*/**/.gitignore",
+  "*/**/__pycache__"
+]
 
 [tool.poetry.dependencies]
 python = "^3.10"
-weblogin = "^1.8"
-typerconf = "^2.6"
-
+requests = "^2.31"
 
 [tool.poetry.group.dev.dependencies]
 pytest = "^8.1.1"

@@ -1,0 +1,47 @@
+\chapter{Overview}
+\label{Overview}
+
+FeedbackFruits (FBF) is an LTI~1.3 tool that runs inside Canvas.
+When an FBF activity is graded, FBF sends Canvas one aggregate per student: a
+score and, at best, a filled-in rubric.
+The data behind that aggregate (who reviewed whom, the score on each
+criterion, the feedback text, the comments) stays in FBF.
+This package fetches that data.
+
+There is no documented API and no login of our own: KTH users only reach FBF
+through an LTI launch from Canvas.
+The package therefore has three parts, which are also its main modules.
+\begin{description}
+\item[The launch] (\cref{Launch}) turns a Canvas API token into an FBF
+  access token.
+  It asks Canvas for a sessionless launch URL, which carries a one-time
+  Canvas login, and then plays the browser's part in the LTI~1.3 handshake:
+  two auto-submitting forms and a chain of redirects.
+\item[The API client] (\cref{API}) uses the access token for FBF's own
+  JSON:API, the one FBF's web app uses.
+  One launch is enough for every FBF course the user teaches, since the token
+  belongs to the user, not to the launched activity.
+\item[The HAR tools] (\cref{HAR}) handle what makes this fragile: the API is
+  private and changes without notice.
+  They reduce a browser capture (a HAR file) to its \emph{shape}---the hops of
+  the launch, the endpoints, the resource types with their attribute
+  names---without a single value, so the shape can be committed and compared
+  with a fresh capture when something breaks.
+\end{description}
+
+The launch is the fragile part with the most moving pieces, so it reports a
+failure by naming the hop that broke.
+The API client depends on the launch only through the access token, which
+lets us test and replace the two independently.
+
+
+\section{The package}
+
+The modules are imported on demand; the package itself only carries the
+version.
+
+<<[[__init__.py]]>>=
+"""Extract detailed data from FeedbackFruits through its Canvas LTI launch."""
+
+__version__ = "0.1"
+@

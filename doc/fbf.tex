@@ -1,0 +1,25 @@
+\documentclass[a4paper,oneside,article]{memoir}
+\let\subsubsection\subsection
+\let\subsection\section
+\let\section\chapter
+\usepackage{noweb}
+% Relax the penalty for breaking code chunks across pages, otherwise there
+% might be a lot of space following a code chunk.
+\def\nwendcode{\endtrivlist \endgroup}
+\let\nwdocspar=\smallbreak
+
+\input{preamble.tex}
+
+\title{%
+  \texttt{fbf}: Detailed data from FeedbackFruits through Canvas
+}
+\author{Daniel Bosk}
+
+\begin{document}
+\maketitle
+\tableofcontents
+\clearpage
+
+\input{../src/fbf/init.tex}
+
+\end{document}
