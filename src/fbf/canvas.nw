@@ -13,8 +13,11 @@ An FBF assignment in Canvas launches
 identifies the FBF \emph{placement} of the activity, that is, where in Canvas
 it sits.
 FBF's placement resource carries the same code and points to the activity.
-So one launch, for any of the selected assignments, gives us a token, and
-the token and the codes give us all the activities without further launches.
+So one launch per Canvas course gives us a token and that course's FBF
+course, and the codes give us its activities without further launches.
+Two things complicate the picture, and the sections below deal with them:
+a code is shared by all the course rounds that copied the assignment, and
+a launch may create an activity.
 
 <<[[canvas.py]]>>=
 """Connect Canvas assignments to FeedbackFruits activities."""
@@ -72,10 +75,46 @@ def test_placement_code():
 @
 
 
-\section{One launch for all}
+\section{Which assignment to launch}
 
-We launch with the first FBF assignment among those selected; any would do,
-since the token is the user's.
+Any FBF assignment of a Canvas course gives us a token, but the choice is
+not free of consequences.
+FBF creates the activities of a new course round lazily: when an assignment
+copied from last year's course is launched for the first time, FBF copies
+last year's activity into this year's FBF course.
+A launch can therefore \emph{create} an activity, which we learned by doing
+it.
+That is harmless in itself, a teacher previewing the assignment does the
+same, but a tool that only reads should not do it.
+So we launch through an assignment whose activity surely exists: one with
+submissions first, then a published one, which students may have opened.
+Only if there is none do we take any FBF assignment.
+
+<<functions>>=
+def launch_order(assignments):
+    """Return the FBF `assignments`, safest to launch first."""
+    return sorted((a for a in assignments if placement_code(a)),
+                  key=lambda a: (not getattr(a, "has_submitted_submissions",
+                                             False),
+                                 not getattr(a, "published", False)))
+@
+
+<<test functions>>=
+def fbf_assignment(code, submitted=False, published=False):
+  a = assignment(f"https://api.feedbackfruits.com/v1/lti/launch?code={code}")
+  a.has_submitted_submissions = submitted
+  a.published = published
+  return a
+
+def test_launch_order_prefers_submitted_then_published():
+  draft = fbf_assignment("d")
+  published = fbf_assignment("p", published=True)
+  submitted = fbf_assignment("s", submitted=True, published=True)
+  other = assignment("https://other.example.com/x?code=o")
+  assert launch_order([draft, other, published, submitted]) \
+    == [submitted, published, draft]
+@
+
 The client gets a [[relaunch]] that repeats the same launch, for when the
 tokens can no longer be refreshed in a long run.
 
@@ -85,41 +124,83 @@ from fbf.api import FBF
 from fbf.launch import launch
 <<functions>>=
 def connect(canvas_url, canvas_token, assignments):
-    """Launch FBF through one of the FBF `assignments`; return an `FBF`.
+    """Launch FBF through the safest of `assignments`; return an `FBF`.
 
-    Returns `None` if none of `assignments` is an FBF assignment.
+    The `assignments` should be of one Canvas course; the client's
+    `login.course_uuid` is then that course's FBF course.  Returns `None`
+    if none of `assignments` is an FBF assignment.
     """
-    for assignment in assignments:
-        if placement_code(assignment):
-            relaunch = functools.partial(
-                launch, canvas_url, canvas_token,
-                assignment.course_id, assignment.id)
-            return FBF(relaunch(), relaunch=relaunch)
+    for assignment in launch_order(assignments):
+        relaunch = functools.partial(launch, canvas_url, canvas_token,
+                                     assignment.course_id, assignment.id)
+        return FBF(relaunch(), relaunch=relaunch)
     return None
 @
 
 
-\section{Finding the activity}
+\section{Finding the activities of this round}
 
-[[/v1/lti/placements]] accepts [[filter[code]]], and the placement's
-[[placeable]] relationship is the activity.
-A word of caution from experience: FBF ignores filters it does not support
-and then returns \emph{everything}---[[/v1/activities?filter[code]=...]]
-returns all activities.
-So we do not trust the filter but check the code of what comes back.
-Should FBF one day ignore this filter too, we get the right answer more
-slowly instead of a wrong one.
+The [[code]] in a Canvas assignment's launch URL is not specific to the
+course round.
+When Canvas copies a course, the copied assignments keep the code, and FBF
+resolves it in the context of the launch: the same code opens last year's
+activity from last year's course and this year's from this year's.
+A global lookup by code---[[/v1/lti/placements?filter[code]=...]]---finds
+the placement of the round that created the code.
+That was our first approach, and it listed discussions from three earlier
+rounds mixed with this one's.
+
+So we resolve codes within the FBF course of the launch, which is the course
+of the Canvas course we launched from.
+Its activities come with their placements ([[include=placement]]), and each
+placement carries the code.
+An assignment whose code is not among them has no activity in this round
+yet: nobody has opened it.
 
 <<imports>>=
 from fbf.schema import attribute, related_id, requires
 <<required names>>=
 requires("lti/placement", attributes=["code"], relationships=["placeable"])
+requires("activities", relationships=["placement"])
 <<functions>>=
-def activity_id(fbf, code):
-    """Return the id of the FBF activity placed with `code`, or `None`."""
-    placements = fbf.get("v1/lti/placements", **{"filter[code]": code})
-    for placement in placements.resources:
-        if attribute(placement, "code") == code:
-            return related_id(placement, "placeable")
-    return None
+def activities_by_code(fbf, course_uuid):
+    """Map placement codes to activity ids in the FBF course `course_uuid`."""
+    document = fbf.get(f"v1/courses/{course_uuid}/activities",
+                       include="placement")
+    placements = {id: placement
+                  for (kind, id), placement in document.included.items()
+                  if kind == "lti/placement"}
+    activities = {}
+    for activity in document.resources:
+        placement = placements.get(related_id(activity, "placement"))
+        if placement:
+            activities[attribute(placement, "code")] = activity["id"]
+    return activities
+@
+
+Commands work on assignments, possibly of several Canvas courses.
+[[fbf_activities]] does the launches and the lookups for them: one launch
+per Canvas course, since each course has its own FBF course.
+It yields each assignment with its client and activity, or with [[None]]
+for an assignment that has no activity in this round, so that the command
+can say so.
+
+<<imports>>=
+import itertools
+<<functions>>=
+def fbf_activities(canvas_url, canvas_token, assignments):
+    """Yield `(assignment, fbf, activity_id)` for the FBF `assignments`.
+
+    `activity_id` is `None` when the assignment has not been opened in FBF
+    in its course round.
+    """
+    by_course = lambda a: a.course_id
+    fbf_assignments = sorted((a for a in assignments if placement_code(a)),
+                             key=by_course)
+    for _, course in itertools.groupby(fbf_assignments, key=by_course):
+        course = list(course)
+        fbf = connect(canvas_url, canvas_token, course)
+        codes = activities_by_code(fbf, fbf.login.course_uuid)
+        for assignment in course:
+            yield assignment, fbf, codes.get(placement_code(assignment))
 @

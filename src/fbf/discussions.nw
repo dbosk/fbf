@@ -391,49 +391,32 @@ The authors should come with the posts, through [[include=user]].
 They do for comments, but the question and answer endpoints ignore the
 parameter and include nobody, so every question and answer would be
 anonymous.
-We therefore take the included users and fetch the missing ones by id, as
-FBF's web app does with [[v1/users?filter[id]=...]], in batches and keeping
-only the users we asked for.
+We therefore take the included users and fetch the missing ones by id
+([[get_by_ids]] of \cref{API}).
 
-<<constants>>=
-BATCH = 50
 <<functions>>=
 def users_of(fbf, document):
     """Map the ids of the authors in `document` to user resources."""
     users = {id: user for (kind, id), user in document.included.items()
              if kind == "users"}
-    missing = sorted({related_id(resource, "user")
-                      for resource in document.resources} - set(users)
-                     - {None})
-    for start in range(0, len(missing), BATCH):
-        batch = missing[start:start + BATCH]
-        found = fbf.get("v1/users", **{"filter[id]": ",".join(batch)})
-        users.update((user["id"], user) for user in found.resources
-                     if user["id"] in batch)
+    missing = {related_id(resource, "user")
+               for resource in document.resources} - set(users)
+    users.update(fbf.get_by_ids("v1/users", missing))
     return users
 @
 
 The choices of all choice questions on a material are fetched together, by
 their ids.
-As with the users, we ask in batches, since a URL has a practical length
-limit, and keep only the choices we asked for.
 
 <<functions>>=
 def fetch_choices(fbf, questions):
     """Map choice ids to the choices of the choice `questions`."""
-    wanted = [reference["id"] for question in questions
-              if question["type"] in CHOICE_QUESTIONS
-              for reference in relationship(question, "choices")
-                                .get("data") or []]
-    choices = {}
-    for start in range(0, len(wanted), BATCH):
-        batch = wanted[start:start + BATCH]
-        document = fbf.get("v1/questions/choices",
-                           **{"filter[id]": ",".join(batch)})
-        choices.update((choice["id"], choice)
-                       for choice in document.resources
-                       if choice["id"] in batch)
-    return choices
+    return fbf.get_by_ids(
+        "v1/questions/choices",
+        [reference["id"] for question in questions
+         if question["type"] in CHOICE_QUESTIONS
+         for reference in relationship(question, "choices").get("data")
+                          or []])
 @
 
 Sorting by position compares strings, which would put [[10:00]] before
@@ -525,10 +508,12 @@ def test_thread_rows_short_and_long():
 
 \section{The command}
 
-The command takes the [[canvaslms]] assignment options, launches FBF through
-the first FBF assignment among the selected, and lists the threads of each.
+The command takes the [[canvaslms]] assignment options, finds the FBF
+activities of the selected assignments in their course round
+(\cref{Canvas}), and lists the threads of each.
 Assignments that are not FBF's are skipped, so [[-c]] alone lists every
-discussion in a course.
+discussion in a course; so are those not yet opened in FBF this round, with
+a note on standard error.
 The threads are labelled with the Canvas assignment name, which is the name
 the user selected them by.
 
@@ -550,14 +535,15 @@ def discussions_command(config, canvas, args):
     if not assignments:
         raise canvaslms.cli.EmptyListError("No FeedbackFruits assignments")
     hostname, token = canvaslms.cli.login.load_credentials(config)
-    fbf = fbfcanvas.connect(canvaslms.cli.cache.normalize_hostname(hostname),
-                            token, assignments)
     threads = []
-    for assignment in assignments:
-        activity = fbfcanvas.activity_id(fbf,
-                                         fbfcanvas.placement_code(assignment))
+    for assignment, fbf, activity in fbfcanvas.fbf_activities(
+            canvaslms.cli.cache.normalize_hostname(hostname), token,
+            assignments):
         if activity:
             threads += activity_threads(fbf, activity, assignment.name)
+        else:
+            print(f"{assignment.name}: not opened in FeedbackFruits "
+                  "this course round, skipped", file=sys.stderr)
     <<output [[threads]] as [[args]] say>>
 @
 

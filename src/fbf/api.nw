@@ -490,3 +490,53 @@ def test_get_many_keeps_order_and_refreshes_once():
   assert [d.resource["id"] for d in documents] == paths
   assert session.refreshes == 1
 @
+
+
+\section{Fetching by ids}
+
+Many relationships in FBF are bare references, ids without a link, and many
+lists name their related resources only by id: the authors of posts, the
+choices of a quiz question, the levels of a rubric.
+FBF's own web app fetches those with a list endpoint and [[filter[id]]], a
+comma-separated list of ids, and so do we.
+[[get_by_ids]] does it in batches, since a URL has a practical length limit,
+and keeps only the resources we asked for: FBF ignores the filters an
+endpoint does not support and then returns everything.
+
+<<constants>>=
+ID_BATCH = 50
+<<FBF methods>>=
+def get_by_ids(self, path, ids):
+    """Map the `ids` to their resources, from the list endpoint `path`.
+
+    Uses `filter[id]` in batches; ids FBF does not return are missing from
+    the result.
+    """
+    ids = sorted(set(ids) - {None})
+    batches = [ids[start:start + ID_BATCH]
+               for start in range(0, len(ids), ID_BATCH)]
+    documents = self.get_many([(path, {"filter[id]": ",".join(batch)})
+                               for batch in batches])
+    wanted = set(ids)
+    return {resource["id"]: resource for document in documents
+            for resource in document.resources if resource["id"] in wanted}
+@
+
+The guard against an ignored filter is what this test checks: the fake
+returns an extra resource, which must not reach the result.
+
+<<test functions>>=
+class EverythingSession:
+  def request(self, method, url, headers=None, params=None, **kwargs):
+    asked = params["filter[id]"].split(",")
+    return SimpleNamespace(status_code=200, ok=True, json=lambda: {
+      "data": [{"type": "users", "id": id} for id in asked + ["stranger"]]})
+
+def test_get_by_ids_batches_and_keeps_only_asked():
+  login = SimpleNamespace(access_token="t", refresh_token=None,
+                          api_url="https://api.example.com")
+  fbf = FBF(login, session=EverythingSession())
+  ids = [f"u{n}" for n in range(120)] + [None, "u1"]
+  users = fbf.get_by_ids("v1/users", ids)
+  assert sorted(users) == sorted(f"u{n}" for n in range(120))
+@
