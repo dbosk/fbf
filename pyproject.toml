@@ -1,31 +1,57 @@
-[tool.poetry]
-name = "fbf"
+[project]
+name = "FeedbackFruits"
 version = "0.1"
-description = "Extract detailed data from FeedbackFruits through its Canvas LTI launch"
-authors = ["Daniel Bosk <dbosk@kth.se>"]
-license = "MIT"
-readme = "README.md"
-packages = [{include = "fbf", from = "src"}]
-include = [
-  {path="src/**/*.py", format="wheel"},
-  {path="src/**/*.nw", format="sdist"},
-  {path="src/**/Makefile", format="sdist"},
-  {path="src/**/*.tex", format="sdist"}
+description = "Detailed FeedbackFruits data (peer reviews, grade breakdowns, discussions) through the Canvas LTI launch"
+authors = [
+  {name = "Daniel Bosk", email = "daniel@bosk.se"}
 ]
-exclude = [
-  {path="src/**/*.py", format="sdist"},
-  {path="src/**/*.nw", format="wheel"},
-  "*/**/.gitignore",
-  "*/**/__pycache__"
+maintainers = [
+  {name = "Daniel Bosk", email = "dbosk@kth.se"}
+]
+readme = "README.md"
+license = "MIT"
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+  "Operating System :: OS Independent",
+  "Environment :: Console",
+  "Intended Audience :: Education",
+  "Topic :: Utilities"
+]
+requires-python = ">=3.10"
+dependencies = [
+  "requests>=2.31",
+  "canvaslms>=6.24"
 ]
 
-[tool.poetry.scripts]
+[project.urls]
+repository = "https://github.com/dbosk/fbf"
+"Bug Tracker" = "https://github.com/dbosk/fbf/issues"
+
+[project.scripts]
 fbf = "fbf.cli:main"
 
-[tool.poetry.dependencies]
-python = "^3.10"
-requests = "^2.31"
-canvaslms = ">=6.24"
+[tool.poetry]
+packages = [{include = "fbf", from = "src"}]
+# Poetry's exclude takes plain globs only (a format key there is ignored),
+# so the literate sources and Makefiles are excluded outright and then put
+# back into the sdist, which needs them to rebuild the .py files. The wheel
+# gets only the tangled .py files. (Same approach as canvaslms.)
+include = [
+  {path="src/**/*.py", format="wheel"},
+  {path="src/fbf/api-shape.txt", format=["sdist", "wheel"]},
+  {path="src/fbf/**/*.nw", format="sdist"},
+  {path="src/fbf/**/Makefile", format="sdist"},
+  {path="makefiles/*.mk", format="sdist"}
+]
+exclude = [
+  "*/**/.gitignore",
+  "src/fbf/**/Makefile",
+  "src/fbf/**/*.nw",
+  "*/**/__pycache__",
+  "*/**/.git",
+  "src/**/CLAUDE.md"
+]
 
 [tool.poetry.group.dev.dependencies]
 pytest = "^8.1.1"
