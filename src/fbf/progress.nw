@@ -1,0 +1,1029 @@
+\chapter{Progress and the grade sent to Canvas}
+\label{Progress}
+
+FBF grades an activity on completion: a student who watched the video and
+wrote the comments asked for gets the full grade, one who watched half of it
+and wrote one comment gets part of it.
+Canvas receives a single number per student, and neither the student nor
+the teacher sees there how it came about.
+FBF's own view shows the parts, but one student at a time.
+The [[progress]] command lists, for every student and FBF assignment, the
+score FBF computes, whether FBF has sent it to Canvas, the score Canvas
+has, and the parts the score is made of.
+
+That answers the questions a teacher gets: why do I have 7 of 10 points,
+why is my grade not in Canvas yet, why does Canvas say something else than
+FBF.
+The last two have options of their own, [[--unpublished]] and
+[[--mismatch]], which leave only the students concerned.
+
+
+\section{How FBF computes the grade}
+
+We learned the model by exploring a course with sixty activities, and
+verified the formula on all of its 9\,468 progresses.
+\Cref{progress-model} shows the resources involved.
+\begin{description}
+\item[Tasks and facets.] An activity consists of tasks, such as
+  watching a video, writing a reflection, submitting a file or reviewing
+  peers.
+  Each kind has a type of its own: [[multimedia-tasks]],
+  [[reflect-tasks]], [[submit-tasks]], [[submission-review-tasks]] and so
+  on.
+  A task is graded on one or more \emph{facets}, such as [[viewed]] or
+  [[comments]].
+  For every facet~$F$ the task has an attribute [[F-facet-weight]], the
+  points it is worth.
+  The weights of all tasks in an activity add up to 100.
+  Facets that count something, such as comments, also have
+  [[F-facet-amount]], the number required for the full weight.
+  A task's [[order]] is its place in the activity; tasks have no titles of
+  their own.
+\item[Progress.] Each student has one [[progresses]] resource per activity.
+  Its attribute [[grades]] maps each task id to the points earned per
+  facet, and [[grades.overall]] is the grade out of 100.
+  A task the student never touched has no entry.
+  Its [[metadata]] maps task ids to what the student did, such as the
+  number of comments; it is [[null]] for a student who did nothing.
+  [[progress]] is the percentage of the activity completed, which FBF shows
+  next to the grade.
+\item[Grade sent.] When FBF sends the grade to Canvas, it sets the
+  progress's [[grades-published-at]] and links the progress through
+  [[latest-grade]] to an [[lti/grade]], whose [[grade]] is the overall grade
+  divided by 100.
+  Canvas scores it as that fraction of the assignment's points.
+\item[Who.] The progress's [[actor]] is an FBF user, of type [[users]] or,
+  for some students who never opened the activity, [[people]].
+  FBF users carry no Canvas or LTI id, so the only key to Canvas is the
+  email address, which [[v1/people/<actor>/emails]] gives for both types.
+\end{description}
+
+The points of a facet are its weight times the fraction completed: all of
+it for a boolean facet like [[viewed]], and the count over the amount,
+capped at one, for counting facets (this held for all but three of some
+1\,750 comment facets, which we cannot explain).
+The overall grade is the sum of the points of all facets, on every
+progress we checked, if we leave out one kind of key: the [[grades]] of a
+multimedia task also have a key per teacher question,
+[[open-question-<id>]] and the like, which is always 0 and has no weight.
+The grade sent is the overall grade over 100 at the time of sending, and
+the score in Canvas is the grade sent times the assignment's points, for
+every grade sent we checked.
+So the score in Canvas should be the overall grade times the points over
+100, unless the student did more after FBF sent the grade (three did) or
+someone changed the score in Canvas.
+
+\begin{figure}
+\centering
+\begin{verbatim}
+activity --tasks--> *-tasks: order, F-facet-weight,
+                             F-facet-amount
+progress --progressable--> activity
+progress: grades = {task id: {F: points}, overall: 0..100}
+  metadata = {task id: {F: count, ...}}, progress = 0..100
+progress --actor--> users | people
+users | people --(v1/people/{id}/emails)--> emails
+progress --latest-grade--> lti/grade: grade = overall / 100
+\end{verbatim}
+\caption{The resources behind a grade and their relationships.}
+\label{progress-model}
+\end{figure}
+
+<<required names>>=
+requires("activities", relationships=["tasks"])
+requires("progresses",
+         attributes=["grades", "metadata", "progress", "grades-published-at"],
+         relationships=["actor", "progressable", "latest-grade"])
+requires("lti/grade", attributes=["grade", "result-status"])
+requires("emails", attributes=["address"])
+@
+
+The facets are read from the data, not from a list of ours (see
+\cref{facets}), so a new facet needs no change in the code.
+We still declare the weights and amounts we know of, so that the contract
+test and [[har-diff]] notice when FBF renames them.
+
+<<required names>>=
+for kind, facets in {
+        "multimedia-tasks": ["viewed", "comments", "discussions",
+                             "discussions-completed", "questions",
+                             "questions-completed"],
+        "reflect-tasks": ["reflection"],
+        "annotate-tasks": ["viewed", "done",
+                           "required-annotations-completed",
+                           "summaries-completed",
+                           "annotations-per-category-completed"],
+        "submit-tasks": ["done", "done-on-time"],
+        "submission-review-tasks": ["done", "reviews",
+                                    "reviewer-feedback-ratings"],
+        "submission-review-view-tasks": ["done", "reviewer-feedback-done"],
+        }.items():
+    requires(kind, attributes=["order"] + [f"{facet}-facet-weight"
+                                           for facet in facets])
+requires("multimedia-tasks",
+         attributes=[f"{facet}-facet-amount"
+                     for facet in ["comments", "discussions", "questions"]])
+requires("submission-review-tasks", attributes=["reviews-facet-amount"])
+@
+
+As in \cref{Discussions}, the module separates fetching from assembling, so
+that every decision can be tested on resources shaped like FBF's.
+The chapter builds the result bottom up: the facets of one task, the
+breakdown of one student's progress and the check that it adds up to the
+grade, the match from FBF users to Canvas students, and the row that joins
+both sides.
+Then come the output and its filters, the requests that fetch the
+resources, and the command that ties them together.
+
+<<[[progress.py]]>>=
+"""Show what the FeedbackFruits grade of each student is made of."""
+
+<<imports>>
+
+<<constants>>
+
+<<classes>>
+
+<<functions>>
+@
+
+<<test [[progress.py]]>>=
+from types import SimpleNamespace
+
+import pytest
+
+from fbf.progress import *
+from fbf.schema import SchemaError
+
+<<test functions>>
+@
+
+
+\section{Facets}
+\label{facets}
+
+A facet is the smallest part of the grade: the points one task gives for
+one thing, out of its weight.
+For counting facets we also keep the count and the amount, which say what
+is missing (\enquote{2 of 3 comments}) better than the points do.
+
+<<imports>>=
+import dataclasses
+<<classes>>=
+@dataclasses.dataclass
+class Facet:
+    """The points of one facet of one task, out of its weight."""
+
+    task_type: str
+    task_order: int
+    name: str
+    points: float
+    weight: float
+    count: float = None
+    amount: int = None
+@
+
+The facets of a task come from two places, and we need both.
+The task's weights list every facet that can give points, also those the
+student has no grade key for; leaving those out would make the maxima of a
+breakdown sum to less than 100.
+The student's grade keys are what FBF actually graded, and for each of them
+we read the weight through [[attribute]] (\cref{Schema}).
+A grade key without a weight is a facet that FBF added after this was
+written, and [[attribute]] then raises [[SchemaError]] instead of letting
+its points go unexplained.
+
+The per-question keys we skip.
+They end in a UUID, which tells them from facets like
+[[questions-completed]].
+
+<<constants>>=
+WEIGHT = "-facet-weight"
+AMOUNT = "-facet-amount"
+QUESTION_KEY = re.compile(
+    r"-question-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
+<<imports>>=
+import re
+from fbf.schema import attribute, related_id, relationship, requires
+<<functions>>=
+def task_facets(task, grades, metadata):
+    """Return the `Facet`s of `task` for one student.
+
+    `grades` and `metadata` are the student's entries for the task, empty
+    if the student never touched it.
+    """
+    attributes = task.get("attributes") or {}
+    names = [name.removesuffix(WEIGHT) for name in attributes
+             if name.endswith(WEIGHT)]
+    names += [name for name in grades
+              if not QUESTION_KEY.search(name) and name not in names]
+    return [Facet(task_type=task_type(task),
+                  task_order=attribute(task, "order"),
+                  name=name,
+                  points=grades.get(name) or 0,
+                  weight=attribute(task, name + WEIGHT) or 0,
+                  count=count(metadata.get(name)),
+                  amount=attributes.get(name + AMOUNT))
+            for name in names]
+@
+
+The task type names the task in the output, without the [[-tasks]] that
+every type ends with.
+
+<<functions>>=
+def task_type(task):
+    """Return the short type of `task`, such as `multimedia`."""
+    return task["type"].removesuffix("-tasks")
+@
+
+The count is less uniform than the points.
+For comments and discussions the metadata has a number under the facet's
+name, and the points are the weight times that number over the amount, as
+FBF says.
+For questions the metadata has a dictionary per question under that name,
+and the review count is under [[total-reviews]], not [[reviews]].
+Both those facets had weight 0 in every task we saw, so we could not check
+which number FBF counts; rather than guess, we leave the count empty
+unless the metadata has a plain number.
+A [[bool]] is a number to Python, but not a count.
+
+<<functions>>=
+def count(value):
+    """Return `value` if it is a count, else `None`."""
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return value
+    return None
+@
+
+Let's verify on a multimedia task shaped like FBF's, with made-up values.
+The student wrote two of three comments; questions have weight 0 and a
+dictionary as metadata; [[viewed]] has a boolean there, which is no count;
+the question key is ignored.
+
+<<test functions>>=
+VIDEO = {"type": "multimedia-tasks", "id": "t1",
+         "attributes": {"order": 1,
+                        "viewed-facet-weight": 40.0,
+                        "comments-facet-weight": 30.0,
+                        "comments-facet-amount": 3,
+                        "questions-facet-weight": 0.0,
+                        "questions-facet-amount": 2}}
+QKEY = "open-question-6f1c2a8e-1b2c-4d3e-8f90-123456789abc"
+
+def test_task_facets_reads_weights_points_and_counts():
+  facets = task_facets(VIDEO, {"viewed": 40, "comments": 20.0, QKEY: 0},
+                       {"viewed": True, "comments": 2,
+                        "questions": {"q": {}}})
+  assert [(f.name, f.points, f.weight, f.count, f.amount)
+          for f in facets] == [("viewed", 40, 40.0, None, None),
+                               ("comments", 20.0, 30.0, 2, 3),
+                               ("questions", 0, 0.0, None, 2)]
+  assert {(f.task_type, f.task_order) for f in facets} \
+    == {("multimedia", 1)}
+@
+
+A task the student never touched still lists its facets, at 0 points, and
+a grade key that has no weight is a schema change.
+
+<<test functions>>=
+def test_task_facets_of_an_untouched_task_keep_the_weights():
+  facets = task_facets(VIDEO, {}, {})
+  assert [(f.points, f.weight) for f in facets] \
+    == [(0, 40.0), (0, 30.0), (0, 0.0)]
+
+def test_task_facets_refuse_a_facet_without_weight():
+  with pytest.raises(SchemaError, match="speed-facet-weight"):
+    task_facets(VIDEO, {"viewed": 40, "speed": 5}, {})
+@
+
+
+\section{The breakdown of a progress}
+
+A student's breakdown is the facets of all graded tasks of the activity, in
+the order of the tasks.
+A task is graded if it has weights; instruction tasks and the like have
+none and drop out.
+
+<<functions>>=
+def graded_tasks(tasks):
+    """Return the `tasks` that have facets, in activity order."""
+    return sorted((task for task in tasks
+                   if any(name.endswith(WEIGHT)
+                          for name in task.get("attributes") or {})),
+                  key=lambda task: attribute(task, "order"))
+
+
+def breakdown(progress, tasks):
+    """Return the `Facet`s of `progress` over the graded `tasks`."""
+    grades = attribute(progress, "grades") or {}
+    metadata = attribute(progress, "metadata") or {}
+    return [facet for task in graded_tasks(tasks)
+            for facet in task_facets(task, grades.get(task["id"]) or {},
+                                     metadata.get(task["id"]) or {})]
+@
+
+The overall grade is the sum of the points, as we verified.
+We check that for every student, because the breakdown is only an
+explanation of the grade if it adds up to it.
+If FBF changes its formula, or grades something we skip, the check fails
+and the command warns, rather than showing parts that do not make the
+whole.
+The tolerance absorbs FBF's rounding.
+
+<<constants>>=
+TOLERANCE = 0.01
+<<functions>>=
+def adds_up(facets, overall):
+    """Whether the points of `facets` sum to `overall`."""
+    return abs(sum(facet.points for facet in facets) - overall) <= TOLERANCE
+@
+
+Let's verify with a progress of two tasks, one of them untouched, listed
+out of order, and an instruction task without weights.
+
+<<test functions>>=
+REFLECT = {"type": "reflect-tasks", "id": "t2",
+           "attributes": {"order": 2, "reflection-facet-weight": 30.0}}
+INSTRUCT = {"type": "instruct-tasks", "id": "t0",
+            "attributes": {"order": 0}}
+
+def progress(actor="a1", overall=60.0, published=None, grade=None,
+             grades=None, metadata=None, percent=50, kind="users"):
+  return {"type": "progresses", "id": f"p-{actor}",
+          "attributes": {
+            "grades": {"overall": overall, "pass-fail": None,
+                       **({"t1": {"viewed": 40, "comments": 20.0}}
+                          if grades is None else grades)},
+            "metadata": metadata, "progress": percent, "viewed": True,
+            "grades-published-at": published},
+          "relationships": {
+            "actor": {"data": {"type": kind, "id": actor}},
+            "progressable": {"data": {"type": "activities", "id": "act"}},
+            "latest-grade": {"data": grade and {"type": "lti/grade",
+                                                "id": grade}}}}
+
+def test_breakdown_follows_task_order_and_adds_up():
+  facets = breakdown(progress(), [REFLECT, INSTRUCT, VIDEO])
+  assert [(f.task_type, f.name, f.points) for f in facets] \
+    == [("multimedia", "viewed", 40), ("multimedia", "comments", 20.0),
+        ("multimedia", "questions", 0), ("reflect", "reflection", 0)]
+  assert sum(f.weight for f in facets) == 100
+  assert adds_up(facets, 60.0)
+  assert not adds_up(facets, 61.0)
+@
+
+
+\section{From FBF users to Canvas students}
+
+FBF knows its users by email address only, so that is how we find them in
+Canvas.
+Canvas has the address as the user's [[email]], and at KTH also as the
+[[login_id]]; we accept either, in any case, since the two systems need not
+agree on capitals.
+An actor may have several addresses, and any of them may match.
+
+<<functions>>=
+def match_actors(emails, students):
+    """Map FBF actor ids to Canvas `students` by email address.
+
+    `emails` maps actor ids to sets of addresses.  Actors without a match,
+    such as teachers, are left out.
+    """
+    by_address = {}
+    for student in students:
+        for key in ("email", "login_id"):
+            address = getattr(student, key, None)
+            if address:
+                by_address.setdefault(address.lower(), student)
+    matched = {}
+    for actor, addresses in emails.items():
+        for address in sorted(address.lower() for address in addresses):
+            if address in by_address:
+                matched[actor] = by_address[address]
+                break
+    return matched
+@
+
+The matching is case insensitive and takes either Canvas field, and an
+actor that is not a student (here a teacher) is not matched.
+
+<<test functions>>=
+STUDENTS = [SimpleNamespace(id=1, login_id="ada@example.com",
+                            email="ada@example.com"),
+            SimpleNamespace(id=2, login_id="bo@example.com", email=None),
+            SimpleNamespace(id=3, login_id=None, email="cy@example.com")]
+
+def test_match_actors_by_email_or_login():
+  matched = match_actors({"a1": {"Ada@Example.com"},
+                          "a2": {"bo@example.com"},
+                          "a3": {"old@example.com", "cy@example.com"},
+                          "teacher": {"t@example.com"}}, STUDENTS)
+  assert {actor: s.id for actor, s in matched.items()} \
+    == {"a1": 1, "a2": 2, "a3": 3}
+@
+
+
+\section{A row per student}
+
+The command's unit is a student in an assignment.
+It joins what FBF says (the progress, the breakdown, the grade sent) with
+what Canvas says (the student and the score).
+The score FBF computes, [[fbf_score]], is the overall grade scaled to the
+assignment's points, the same scaling Canvas applies to the grade FBF
+sends, so it compares directly with [[canvas_score]].
+
+<<classes>>=
+@dataclasses.dataclass
+class Progress:
+    """A student's FBF grade in an assignment, and what it is made of."""
+
+    assignment: str
+    points_possible: float
+    student: str
+    canvas_user_id: int
+    fbf_actor_id: str = None
+    progress: int = None
+    overall: float = None
+    fbf_score: float = None
+    published: bool = False
+    sent_grade: float = None
+    sent_status: str = None
+    canvas_score: float = None
+    facets: list = dataclasses.field(default_factory=list)
+@
+
+Every Canvas student gets a row, also those who never opened the activity
+and so have no progress in FBF: they are the ones a teacher may need to
+remind.
+Their FBF fields stay [[None]], which tells them from a student with
+progress 0.
+FBF users who are not students in Canvas---teachers, assistants, students
+who dropped out---get no row, since Canvas has no grade of theirs to
+explain.
+
+The student is named by the Canvas login, which is what the other
+[[canvaslms]] commands show.
+Of the arguments, [[scores]] maps Canvas user ids to their scores in the
+assignment, and [[sent]] maps the ids of the grades sent to the
+[[lti/grade]] resources.
+
+<<functions>>=
+def assemble(assignment, tasks, progresses, sent, student_of, students,
+             scores):
+    """Return the `Progress` of every Canvas student in `assignment`.
+
+    `student_of` maps actor ids to students (see `match_actors`).
+    """
+    rows = {}
+    for resource in progresses:
+        student = student_of.get(related_id(resource, "actor"))
+        if student is not None:
+            rows[student.id] = progress_row(assignment, resource, tasks,
+                                            sent, student, scores)
+    for student in students:
+        if student.id not in rows:
+            rows[student.id] = Progress(
+                assignment=assignment.name,
+                points_possible=assignment.points_possible,
+                student=student_name(student), canvas_user_id=student.id,
+                canvas_score=scores.get(student.id))
+    return sorted(rows.values(), key=lambda row: row.student)
+
+
+def student_name(student):
+    """Return the name we show for a Canvas `student`."""
+    return (getattr(student, "login_id", None)
+            or getattr(student, "email", None) or str(student.id))
+@
+
+The row of a student with progress fills in the FBF side.
+A grade sent is optional: [[latest-grade]] is empty until FBF publishes.
+
+<<functions>>=
+def progress_row(assignment, resource, tasks, sent, student, scores):
+    """Return the `Progress` of a student with a progress `resource`."""
+    overall = (attribute(resource, "grades") or {}).get("overall") or 0
+    points = assignment.points_possible
+    grade = sent.get(related_id(resource, "latest-grade"))
+    return Progress(
+        assignment=assignment.name, points_possible=points,
+        student=student_name(student), canvas_user_id=student.id,
+        fbf_actor_id=related_id(resource, "actor"),
+        progress=attribute(resource, "progress"),
+        overall=overall,
+        fbf_score=None if points is None else overall / 100 * points,
+        published=bool(attribute(resource, "grades-published-at")),
+        sent_grade=attribute(grade, "grade") if grade else None,
+        sent_status=attribute(grade, "result-status") if grade else None,
+        canvas_score=scores.get(student.id),
+        facets=breakdown(resource, tasks))
+@
+
+Let's verify with three students: one with a published grade, one whose
+grade FBF has not sent, and one without progress; and a teacher, who has
+progress but is not a student.
+
+<<test functions>>=
+ASSIGNMENT = SimpleNamespace(name="Week 1", points_possible=10)
+SENT = {"g1": {"type": "lti/grade", "id": "g1",
+               "attributes": {"grade": 0.6, "result-status": "success"}}}
+
+def test_assemble_joins_fbf_and_canvas():
+  progresses = [progress("a1", published="2026-10-01", grade="g1"),
+                progress("a2", overall=40.0,
+                         grades={"t1": {"viewed": 40}}),
+                progress("teacher")]
+  student_of = {"a1": STUDENTS[0], "a2": STUDENTS[1]}
+  rows = assemble(ASSIGNMENT, [VIDEO, REFLECT], progresses, SENT,
+                  student_of, STUDENTS, {1: 6.0, 3: 0.0})
+  ada, bo, cy = rows
+  assert (ada.student, ada.overall, ada.fbf_score, ada.published,
+          ada.sent_grade, ada.sent_status, ada.canvas_score) \
+    == ("ada@example.com", 60.0, 6.0, True, 0.6, "success", 6.0)
+  assert (bo.fbf_score, bo.published, bo.sent_grade, bo.canvas_score) \
+    == (4.0, False, None, None)
+  assert (cy.student, cy.progress, cy.overall, cy.fbf_score, cy.facets,
+          cy.canvas_score) == ("cy@example.com", None, None, None, [], 0.0)
+@
+
+Whether FBF published a grade is the progress's to say, also when the
+grade it sent is missing from what we fetched.
+
+<<test functions>>=
+def test_published_comes_from_the_progress():
+  [row] = assemble(ASSIGNMENT, [VIDEO], [progress(published="2026-10-01",
+                                                  grade="gone")],
+                   SENT, {"a1": STUDENTS[0]}, STUDENTS[:1], {})
+  assert (row.published, row.sent_grade) == (True, None)
+@
+
+
+\section{Output}
+
+The default output is a row per student and assignment, in the
+[[canvaslms]] way: fields separated by the delimiter, tab by default.
+The fields are the assignment, the student, the progress in percent, the
+overall grade out of 100, FBF's score in the assignment's points, whether
+FBF has published it, the score in Canvas, and the breakdown.
+The breakdown is one field, readable at a glance (here broken after the
+semicolon, which the output does not do):
+\begin{verbatim}
+multimedia 1: viewed 40/40, comments 20/30 (2/3);
+reflect 2: reflection 0/30
+\end{verbatim}
+Facets with weight 0 cannot give points, and FBF has many of them (every
+multimedia task has a [[questions]] weight, usually 0), so the compact
+breakdown leaves them out; [[--long]] shows them.
+Numbers are rounded to two decimals and printed without trailing zeros,
+since FBF's points are often fractions like $20.0$ or $13.333\ldots$.
+
+<<functions>>=
+def number(value):
+    """Return `value` rounded to two decimals as a string, `""` if `None`."""
+    return "" if value is None else format(round(value, 2), "g")
+
+
+def compact(facets):
+    """Return the compact breakdown of `facets`."""
+    tasks = {}
+    for facet in facets:
+        if facet.weight:
+            tasks.setdefault((facet.task_type, facet.task_order),
+                             []).append(facet_text(facet))
+    return "; ".join(f"{kind} {order}: {', '.join(texts)}"
+                     for (kind, order), texts in tasks.items())
+
+
+def facet_text(facet):
+    """Return a facet as `name points/weight`, with `(count/amount)`."""
+    text = f"{facet.name} {number(facet.points)}/{number(facet.weight)}"
+    if facet.count is not None and facet.amount is not None:
+        text += f" ({number(facet.count)}/{facet.amount})"
+    return text
+@
+
+With [[--long]] each facet gets a row of its own, with the task's order and
+type, the points and weight, and the count and amount where there are any.
+That is the form to sort or sum in a spreadsheet.
+A student without progress has no facets and so no rows.
+
+<<functions>>=
+def progress_rows(rows, long=False):
+    """Yield output rows (lists of strings) for the `Progress` `rows`."""
+    for row in rows:
+        if long:
+            for facet in row.facets:
+                yield [row.assignment, row.student, str(facet.task_order),
+                       facet.task_type, facet.name, number(facet.points),
+                       number(facet.weight), number(facet.count),
+                       number(facet.amount)]
+        else:
+            yield [row.assignment, row.student,
+                   "" if row.progress is None else str(row.progress),
+                   number(row.overall), number(row.fbf_score),
+                   "yes" if row.published else "no",
+                   number(row.canvas_score), compact(row.facets)]
+@
+
+<<test functions>>=
+def test_progress_rows_short_and_long():
+  facets = [Facet("multimedia", 1, "viewed", 40, 40.0),
+            Facet("multimedia", 1, "comments", 13.3333, 30.0, 1, 3),
+            Facet("multimedia", 1, "questions", 0, 0.0, None, 2),
+            Facet("reflect", 2, "reflection", 0, 30.0)]
+  row = Progress("Week 1", 10, "ada@example.com", 1, "a1", 50, 53.3333,
+                 5.33333, False, None, None, None, facets)
+  assert list(progress_rows([row])) == [
+    ["Week 1", "ada@example.com", "50", "53.33", "5.33", "no", "",
+     "multimedia 1: viewed 40/40, comments 13.33/30 (1/3); "
+     "reflect 2: reflection 0/30"]]
+  long = list(progress_rows([row], long=True))
+  assert long[2] == ["Week 1", "ada@example.com", "1", "multimedia",
+                     "questions", "0", "0", "", "2"]
+  assert len(long) == 4
+  empty = Progress("Week 1", 10, "cy@example.com", 3)
+  assert list(progress_rows([empty])) == [
+    ["Week 1", "cy@example.com", "", "", "", "no", "", ""]]
+  assert list(progress_rows([empty], long=True)) == []
+@
+
+A counting facet whose count we do not know shows no count, rather than a
+count of nothing.
+
+<<test functions>>=
+def test_facet_text_shows_only_known_counts():
+  assert facet_text(Facet("multimedia", 1, "comments", 0, 30.0, None, 3)) \
+    == "comments 0/30"
+@
+
+\subsection{Selecting students}
+
+Two questions come up often enough to deserve an option each.
+\begin{description}
+\item[Why is my grade not in Canvas?] FBF publishes grades when the teacher
+  or a deadline says so, not as students work.
+  [[--unpublished]] keeps the students who have earned something that FBF
+  has not published.
+\item[Why does Canvas say something else?] FBF sends a grade when it
+  publishes; if the student does more afterwards, or a teacher changes the
+  score in Canvas, the two drift apart.
+  [[--mismatch]] keeps the students whose Canvas score differs from FBF's
+  score.
+  A Canvas score for a student without progress is one, as FBF would
+  give 0.
+  A student without a Canvas score is one only if FBF has published a
+  grade: then Canvas lost the score or never got it, which we found for
+  63 students in four assignments of our course, all with grades FBF
+  reported as sent.
+  Without a published grade, the missing score is what
+  [[--unpublished]] is for.
+\end{description}
+Given both, a row must meet both, as with other filters.
+
+<<functions>>=
+def unpublished(row):
+    """Whether `row` has points that FBF has not published."""
+    return (row.overall or 0) > 0 and not row.published
+
+
+def mismatch(row):
+    """Whether the Canvas score of `row` differs from FBF's score.
+
+    A missing Canvas score differs only from a published FBF grade.
+    """
+    if row.canvas_score is None:
+        return row.published
+    return abs(row.canvas_score - (row.fbf_score or 0)) > TOLERANCE
+@
+
+<<test functions>>=
+def test_filters():
+  def row(**fields):
+    return Progress("W", 10, "s", 1, **fields)
+  assert unpublished(row(overall=10.0))
+  assert not unpublished(row(overall=10.0, published=True))
+  assert not unpublished(row(overall=0.0))
+  assert not unpublished(row())
+  assert mismatch(row(fbf_score=6.0, canvas_score=5.0))
+  assert not mismatch(row(fbf_score=6.0, canvas_score=6.004))
+  assert not mismatch(row(fbf_score=6.0))
+  assert mismatch(row(fbf_score=6.0, published=True))
+  assert mismatch(row(canvas_score=3.0))
+@
+
+
+\section{Fetching}
+
+The FBF side of an assignment takes four kinds of request, the Canvas side
+two.
+The tasks come with the activity, through [[include=tasks]], since the
+activity has them as bare references (\cref{API}).
+
+<<functions>>=
+def activity_tasks(fbf, activity_id):
+    """Return the tasks of the activity `activity_id`."""
+    document = fbf.get(f"v1/activities/{activity_id}", include="tasks")
+    references = relationship(document.resource, "tasks").get("data") or []
+    return [document.included[(reference["type"], reference["id"])]
+            for reference in references]
+@
+
+The progresses of an activity are one request, [[v1/progresses]] with the
+activity's id as a parameter.
+FBF ignores parameters it does not support and then returns all
+progresses the user can see, which would mix activities silently.
+We therefore keep only the progresses of this activity.
+
+<<functions>>=
+def activity_progresses(fbf, activity_id):
+    """Return the progresses of the students in the activity."""
+    return [progress for progress in
+            fbf.get("v1/progresses", activity_id=activity_id).resources
+            if related_id(progress, "progressable") == activity_id]
+@
+
+A recording cannot make FBF ignore the parameter, so we let a client that
+returns everything stand in for FBF (as for [[get_by_ids]] in \cref{API}):
+the progress of another activity must not get through.
+
+<<test functions>>=
+from fbf.api import Document
+
+class EverythingFBF:
+  def get(self, path, **params):
+    other = progress("a9")
+    other["relationships"]["progressable"]["data"]["id"] = "elsewhere"
+    return Document({"data": [progress("a1"), other]})
+
+def test_activity_progresses_keeps_only_the_activity():
+  found = activity_progresses(EverythingFBF(), "act")
+  assert [related_id(p, "actor") for p in found] == ["a1"]
+@
+
+The grades sent are fetched by the ids that the progresses point to.
+The email addresses are the expensive part: one request per student, since
+FBF offers no list of them.
+A course's activities have mostly the same students, so we fetch each
+actor's addresses once per run and keep them in [[known]], which the
+command passes from assignment to assignment.
+
+<<functions>>=
+def sent_grades(fbf, progresses):
+    """Map the `lti/grade` ids of `progresses` to the grades sent."""
+    return fbf.get_by_ids("v1/lti/grades",
+                          [related_id(progress, "latest-grade")
+                           for progress in progresses])
+
+
+def actor_emails(fbf, actors, known):
+    """Add the email addresses of `actors` to `known`; return `known`.
+
+    `known` maps actor ids to sets of addresses.
+    """
+    missing = sorted(set(actors) - set(known))
+    documents = fbf.get_many([(f"v1/people/{actor}/emails", {})
+                              for actor in missing])
+    for actor, document in zip(missing, documents):
+        known[actor] = {attribute(email, "address")
+                        for email in document.resources
+                        if attribute(email, "address")}
+    return known
+@
+
+On the Canvas side we need the course's students, with their email
+addresses, which Canvas gives only when asked, and the assignment's scores.
+The students we fetch once per course, like the addresses.
+
+We cannot leave the choice of students to Canvas.
+The Canvas object that [[canvaslms]] hands the command caches a course's
+users and returns all of them, whatever [[enrollment_type]] says; in our
+course that added two dozen teaching assistants, who then got rows of
+their own.
+[[canvaslms]]'s own commands filter by the users' enrollments, and so do
+we: we ask for the enrollments and keep the users with a student
+enrollment.
+A user without enrollments we drop, since then we cannot tell.
+
+<<functions>>=
+def course_students(canvas, course_id, known):
+    """Return the students of a Canvas course, from `known` if there."""
+    if course_id not in known:
+        course = canvas.get_course(course_id)
+        known[course_id] = students_only(course.get_users(
+            enrollment_type=["student"], include=["email", "enrollments"]))
+    return known[course_id]
+
+
+def students_only(users):
+    """Return the Canvas `users` that have a student enrollment."""
+    return [user for user in users
+            if any(enrollment.get("type") == "StudentEnrollment"
+                   for enrollment in getattr(user, "enrollments", None)
+                                     or [])]
+
+
+def canvas_scores(assignment):
+    """Map Canvas user ids to their scores in `assignment`."""
+    return {submission.user_id: submission.score
+            for submission in assignment.get_submissions()}
+@
+
+The users are shaped like [[canvasapi]]'s, whose [[enrollments]] are plain
+dictionaries; a user with two enrollments, one of them as a student,
+counts as a student.
+
+<<test functions>>=
+def test_students_only_keeps_student_enrollments():
+  def user(id, *types):
+    return SimpleNamespace(id=id, enrollments=[{"type": t} for t in types])
+  users = [user(1, "StudentEnrollment"), user(2, "TaEnrollment"),
+           user(3, "TaEnrollment", "StudentEnrollment"), user(4),
+           SimpleNamespace(id=5)]
+  assert [u.id for u in students_only(users)] == [1, 3]
+@
+
+[[assignment_progress]] puts the pieces together for one assignment and
+warns about what it leaves out or cannot explain.
+The warnings give counts, not names: they go to standard error, where they
+end up in logs that should hold no personal data.
+
+<<imports>>=
+import sys
+<<functions>>=
+def assignment_progress(fbf, canvas, assignment, activity_id, emails,
+                        students):
+    """Return the `Progress` rows of a Canvas `assignment`.
+
+    `activity_id` is the assignment's FBF activity; `emails` and `students`
+    are caches as in `actor_emails` and `course_students`.
+    """
+    tasks = activity_tasks(fbf, activity_id)
+    progresses = activity_progresses(fbf, activity_id)
+    actors = {related_id(progress, "actor") for progress in progresses}
+    actor_emails(fbf, actors, emails)
+    members = course_students(canvas, assignment.course_id, students)
+    student_of = match_actors({actor: emails[actor] for actor in actors},
+                              members)
+    rows = assemble(assignment, tasks, progresses,
+                    sent_grades(fbf, progresses), student_of, members,
+                    canvas_scores(assignment))
+    <<warn about actors left out and grades not explained>>
+    return rows
+@
+
+<<warn about actors left out and grades not explained>>=
+if len(actors) > len(student_of):
+    print(f"{assignment.name}: {len(actors) - len(student_of)} FBF "
+          "participants are not students in Canvas, left out",
+          file=sys.stderr)
+graded = [row for row in rows if row.overall is not None]
+unexplained = sum(1 for row in graded
+                  if not adds_up(row.facets, row.overall))
+if unexplained:
+    print(f"{assignment.name}: {unexplained} of {len(graded)} breakdowns "
+          "do not add up to the overall grade; FeedbackFruits may have "
+          "changed how it grades", file=sys.stderr)
+@
+
+
+\section{The command}
+
+The command follows [[discussions]] (\cref{Discussions}): it takes the
+[[canvaslms]] assignment options, skips assignments that are not FBF's, and
+notes those not opened in FBF this round.
+
+<<imports>>=
+import json
+import canvaslms.cli
+import canvaslms.cli.assignments
+import canvaslms.cli.cache
+import canvaslms.cli.login
+from fbf import canvas as fbfcanvas
+<<functions>>=
+def progress_command(config, canvas, args):
+    """Show the grade breakdown of the selected FBF assignments."""
+    assignments = [a for a in
+                   canvaslms.cli.assignments.process_assignment_option(
+                       canvas, args)
+                   if fbfcanvas.placement_code(a)]
+    if not assignments:
+        raise canvaslms.cli.EmptyListError("No FeedbackFruits assignments")
+    hostname, token = canvaslms.cli.login.load_credentials(config)
+    emails, students, rows = {}, {}, []
+    for assignment, fbf, activity in fbfcanvas.fbf_activities(
+            canvaslms.cli.cache.normalize_hostname(hostname), token,
+            assignments):
+        if activity:
+            rows += assignment_progress(fbf, canvas, assignment, activity,
+                                        emails, students)
+        else:
+            print(f"{assignment.name}: not opened in FeedbackFruits "
+                  "this course round, skipped", file=sys.stderr)
+    rows = [row for row in rows
+            if (not args.unpublished or unpublished(row))
+            and (not args.mismatch or mismatch(row))]
+    <<output [[rows]] as [[args]] say>>
+@
+
+<<output [[rows]] as [[args]] say>>=
+if args.json:
+    json.dump([dataclasses.asdict(row) for row in rows],
+              sys.stdout, indent=2, ensure_ascii=False)
+    print()
+else:
+    delimiter = getattr(args, "delimiter", "\t")
+    for row in progress_rows(rows, long=args.long):
+        print(delimiter.join(row))
+@
+
+<<functions>>=
+def add_command(subp):
+    """Add the `progress` command to `subp`."""
+    parser = subp.add_parser(
+        "progress",
+        help="Show what the FBF grade of each student is made of",
+        description="Show, per student and FBF assignment: progress %, "
+                    "overall grade (of 100), FBF's score in points, "
+                    "whether FBF published it, the Canvas score, and the "
+                    "points per task and facet.")
+    canvaslms.cli.assignments.add_assignment_option(parser, ungraded=False)
+    parser.add_argument("-l", "--long", action="store_true",
+                        help="one row per task facet instead of per student")
+    parser.add_argument("--unpublished", action="store_true",
+                        help="only students with points FBF has not "
+                             "published")
+    parser.add_argument("--mismatch", action="store_true",
+                        help="only students whose Canvas score differs "
+                             "from FBF's")
+    parser.add_argument("--json", action="store_true",
+                        help="print the rows with their facets as JSON")
+    parser.set_defaults(func=progress_command)
+@
+
+
+\section{Examples for the contract test}
+
+The contract test (\cref{Schema}) needs an example of every type declared
+above.
+Progresses and email addresses the launched activity has.
+The task types and the grades sent may need a search: not every activity
+has a reflection or a peer review, and a grade exists only where FBF has
+published one, which it had not for the launched activity when we wrote
+this.
+So the fetchers look at the launched activity first and then at the other
+activities of its course, as those of \cref{Discussions} do.
+The multimedia task and the activity have fetchers there already.
+
+<<example fetchers>>=
+from fbf import progress as progress_module
+
+
+def progress_activities(fbf, launched):
+    """Yield the launched activity's id, then the others in its course."""
+    yield launched.activity_uuid
+    for activity in fbf.get(
+            f"v1/courses/{launched.course_uuid}/activities").resources:
+        if activity["id"] != launched.activity_uuid:
+            yield activity["id"]
+
+
+def progress_example(fbf, launched, kind, resources_of):
+    """Return the first resource of `kind` among `resources_of` an
+    activity."""
+    for activity in progress_activities(fbf, launched):
+        for resource in resources_of(fbf, activity):
+            if resource["type"] == kind:
+                return resource
+    raise LookupError(f"no {kind} in the launched course")
+
+
+def progress_sent_grades(fbf, activity):
+    """List the grades sent for the activity."""
+    progresses = progress_module.activity_progresses(fbf, activity)
+    return progress_module.sent_grades(fbf, progresses).values()
+
+
+@example("progresses")
+def progress_of_the_launched_activity(fbf, launched):
+    return progress_module.activity_progresses(
+        fbf, launched.activity_uuid)[0]
+
+
+@example("emails")
+def progress_email(fbf, launched):
+    progress = progress_of_the_launched_activity(fbf, launched)
+    actor = progress_module.related_id(progress, "actor")
+    return fbf.get(f"v1/people/{actor}/emails").resources[0]
+
+
+@example("lti/grade")
+def progress_grade_sent(fbf, launched):
+    return progress_example(fbf, launched, "lti/grade",
+                            progress_sent_grades)
+
+
+for kind in ["reflect-tasks", "annotate-tasks", "submit-tasks",
+             "submission-review-tasks", "submission-review-view-tasks"]:
+    example(kind)(lambda fbf, launched, kind=kind: progress_example(
+        fbf, launched, kind, progress_module.activity_tasks))
+@
