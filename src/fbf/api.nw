@@ -585,10 +585,18 @@ token, so we inject the refusal: a session whose first request gets a
 [[401]] without reaching FBF.
 Everything after it is real: the refresh at [[/oauth/token]] and the
 repeated request go to FBF, or to the recording.
-We check the requests at the boundary, the session, since the renewal is
-visible nowhere else: in replay the old and the new tokens are the same
-placeholder.
+We check the requests at the boundary, the session: which requests went
+out, and whether each carried the expired token.
+Before the request we replace the access token with one we know to be
+expired; in replay the launch's token and the renewed one are the same
+placeholder, so only a token of our own shows that the renewal replaced it
+and that the repeated request used the new one.
+The comparisons with the token go into variables before the asserts, since
+in a live run [[pytest]] would otherwise print the new, real token on a
+failure.
 <<test functions>>=
+EXPIRED_TOKEN = "an expired token"
+
 class FirstRequestUnauthorized(requests.Session):
   """A session whose first request gets 401, as with an expired token."""
 
@@ -597,7 +605,9 @@ class FirstRequestUnauthorized(requests.Session):
     self.sent = []
 
   def request(self, method, url, *args, **kwargs):
-    self.sent.append((method, urllib.parse.urlsplit(url).path))
+    bearer = kwargs.get("headers", {}).get("Authorization", "")
+    self.sent.append((method, urllib.parse.urlsplit(url).path,
+                      bearer == f"Bearer {EXPIRED_TOKEN}"))
     if len(self.sent) == 1:
       response = requests.Response()
       response.status_code = 401
@@ -609,9 +619,12 @@ class FirstRequestUnauthorized(requests.Session):
 def test_request_renews_the_tokens_on_401(fbf):
   session = FirstRequestUnauthorized()
   client = FBF(fbf.login, session=session)
+  client.login.access_token = EXPIRED_TOKEN
   document = client.get("v1/users/current")
   assert document.resource["type"] == "users"
-  assert session.sent == [("GET", "/v1/users/current"),
-                          ("POST", TOKEN_PATH),
-                          ("GET", "/v1/users/current")]
+  renewed = client.login.access_token != EXPIRED_TOKEN
+  assert renewed, "the renewal kept the expired access token"
+  assert session.sent == [("GET", "/v1/users/current", True),
+                          ("POST", TOKEN_PATH, False),
+                          ("GET", "/v1/users/current", False)]
 @
