@@ -588,6 +588,19 @@ def test_make_reviews_refuses_comments_and_ratings_it_cannot_place():
                  [rating("s9", "a1", "c9", "o0")], CRITERIA, OPTIONS, USERS)
 @
 
+The fallbacks of [[make_comment]] and [[name_of]] work too: a comment on
+something other than the work or a file shows that thing's type, and a
+missing user gives an empty name.
+
+<<test functions>>=
+def test_unknown_parents_and_missing_users_show_as_such():
+  comment = make_comment(review("r1", "a1", "c2", "Hm", "2026-10-01T10:00Z",
+                                parent="assignments/annotation"))
+  assert comment.on == "assignments/annotation"
+  assert name_of(USERS, "u1") == "Bo"
+  assert name_of(USERS, "gone") == ""
+@
+
 
 \section{Fetching an activity's reviews}
 
