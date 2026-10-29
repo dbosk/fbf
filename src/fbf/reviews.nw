@@ -393,7 +393,7 @@ def make_reviews(activity, allocations, reviews, ratings, criteria,
     """
     check_criteria(criteria)
     <<group comments and ratings by allocation and criterion>>
-    result = []
+    result, placed = [], set()
     for allocation in allocations:
         reviewer = name_of(users, person(allocation, "actor"))
         reviewee = name_of(users, person(allocation, "allocable"))
@@ -401,7 +401,9 @@ def make_reviews(activity, allocations, reviews, ratings, criteria,
                                 key=lambda c: attribute(c, "order")):
             key = (allocation["id"], criterion["id"])
             if key in comments or key in chosen:
+                placed.add(key)
                 <<add the [[Review]] of [[key]] to [[result]]>>
+    <<refuse comments and ratings that were not placed>>
     return sorted(result, key=lambda review: (review.reviewee,
                                               review.reviewer))
 @
@@ -454,6 +456,24 @@ if key in chosen:
 result.append(Review(activity, reviewee, reviewer,
                      attribute(criterion, "title"),
                      level, score, comments.get(key, [])))
+@
+
+Every comment and rating should land in some [[Review]].
+One whose allocation or criterion is not among those we were given would
+otherwise be dropped silently, and the listing would look complete while it
+is not; so we keep track of the pairs we placed and refuse to go on if any
+are left.
+The message gives the count and the ids, never the texts.
+
+<<refuse comments and ratings that were not placed>>=
+for name, found in [("comments", comments), ("ratings", chosen)]:
+    left = sorted(set(found) - placed)
+    if left:
+        raise LookupError(
+            f"{name} on {len(left)} unknown (allocation, criterion) "
+            f"pairs: {left[:UNPLACED_SHOWN]}")
+<<constants>>=
+UNPLACED_SHOWN = 5
 @
 
 A user who has left the course may be missing from the users we get, and
@@ -550,6 +570,22 @@ def test_make_reviews_refuses_missing_options_and_unknown_criteria():
   scale = dict(criterion("c3", "Scale", 2), type="assignments/scale-criterion")
   with pytest.raises(UnknownTypeError):
     make_reviews("Essay", [], [], [], CRITERIA + [scale], OPTIONS, USERS)
+@
+
+A comment or a rating that belongs to no allocation or criterion we know
+would vanish from the output without a trace, so it is an error too.
+The test has one of each: a comment of an allocation we were not given,
+and a rating on a criterion we were not given.
+
+<<test functions>>=
+def test_make_reviews_refuses_comments_and_ratings_it_cannot_place():
+  with pytest.raises(LookupError, match=r"comments on 1 .*'a9'"):
+    make_reviews("Essay", [allocation("a1")],
+                 [review("r9", "a9", "c2", "Lost", "2026-10-01T10:00Z")],
+                 [], CRITERIA, OPTIONS, USERS)
+  with pytest.raises(LookupError, match=r"ratings on 1 .*'c9'"):
+    make_reviews("Essay", [allocation("a1")], [],
+                 [rating("s9", "a1", "c9", "o0")], CRITERIA, OPTIONS, USERS)
 @
 
 
