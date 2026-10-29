@@ -651,6 +651,23 @@ def require_service(request, recording, launched):
     return None
 @
 
+Let's verify the first rule in an inner run (\cref{InnerRuns}): a test that
+asks for [[fbf]] without the [[vcr]] mark fails, and says why, even in
+replay where it would otherwise be skipped for want of a cassette.
+<<test functions>>=
+UNMARKED_TEST = """
+def test_forgets_the_mark(fbf):
+  pass
+"""
+
+def test_a_service_test_without_the_vcr_mark_fails(pytester, monkeypatch):
+  make_inner_conftest(pytester, monkeypatch)
+  pytester.makepyfile(test_inner=UNMARKED_TEST)
+  result = pytester.runpytest_inprocess("-p", "no:cacheprovider")
+  result.assert_outcomes(errors=1)
+  result.stdout.fnmatch_lines(["*must be marked vcr*"])
+@
+
 Each test gets a client of its own, so that no state carries over from one
 test to the next.
 What the clients share differs by mode.
