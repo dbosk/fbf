@@ -876,14 +876,26 @@ On the Canvas side we need the course's students, with their email
 addresses, which Canvas gives only when asked, and the assignment's scores.
 The students we fetch once per course, like the addresses.
 
-We cannot leave the choice of students to Canvas.
-The Canvas object that [[canvaslms]] hands the command caches a course's
-users and returns all of them, whatever [[enrollment_type]] says; in our
-course that added two dozen teaching assistants, who then got rows of
-their own.
-[[canvaslms]]'s own commands filter by the users' enrollments, and so do
-we: we ask for the enrollments and keep the users with a student
-enrollment.
+We ask for the whole roster and choose the students ourselves, instead of
+leaving the choice to Canvas with [[enrollment_type]].
+The Canvas object that [[canvaslms]] hands the command keeps its cache in a file
+it shares with the [[canvaslms]] command and other programs, and in that cache a
+listing counts as complete.
+What a restricted request does therefore depends on the version of [[canvaslms]].
+Before [[canvaslms]] pull request \#579, one of two things happens.
+If the cache holds the whole roster, we get all of it, whatever
+[[enrollment_type]] says; in our course that added two dozen teaching assistants,
+who then got rows of their own.
+If it doesn't, the students alone are stored as the roster, and the next program
+reading the cache cannot find the teaching assistants.
+From that change on, the request goes to Canvas uncached, so every run would
+fetch the roster again.
+
+Asking for everything avoids all three and loses nothing.
+The enrollments tell us who is a student, so the filter works the same here as
+at Canvas, and [[canvaslms]]'s own commands do the same, so one cached listing
+serves us all.
+We keep the users with a student enrollment.
 A user without enrollments we drop, since then we cannot tell.
 
 <<functions>>=
@@ -892,7 +904,7 @@ def course_students(canvas, course_id, known):
     if course_id not in known:
         course = canvas.get_course(course_id)
         known[course_id] = students_only(course.get_users(
-            enrollment_type=["student"], include=["email", "enrollments"]))
+            include=["email", "enrollments"]))
     return known[course_id]
 
 
@@ -923,6 +935,81 @@ def test_students_only_keeps_student_enrollments():
            user(3, "TaEnrollment", "StudentEnrollment"), user(4),
            User(None, {"id": 5})]
   assert [u.id for u in students_only(users)] == [1, 3]
+@
+
+What must hold for the others sharing the cache cannot be seen with stand-ins
+for the users, since it depends on what [[canvaslms]]'s cache does with our
+request.
+So we run the real client and the real cache against a local server (rung~2 of
+the testing ladder), which answers as Canvas does: it honours
+[[enrollment_type]] and sends emails and enrollments only when asked.
+A roster request for the course has to leave the listing whole: the teaching
+assistant stays out of our students but is still there, without another
+request, for the next reader of the cache.
+
+<<test functions>>=
+import http.server
+import json
+import threading
+import urllib.parse
+
+import canvasapi
+
+ROSTER = [{"id": 1, "name": "A Student", "email": "a@example.org",
+           "enrollments": [{"type": "StudentEnrollment"}]},
+          {"id": 2, "name": "A Assistant", "email": "b@example.org",
+           "enrollments": [{"type": "TaEnrollment"}]}]
+
+def roster_answer(query):
+  people = ROSTER
+  if "enrollment_type[]" in query:
+    people = [person for person in people
+              if person["enrollments"][0]["type"] == "StudentEnrollment"]
+  included = query.get("include[]", [])
+  return [{key: value for key, value in person.items()
+           if key in ("id", "name") or key in included}
+          for person in people]
+
+@pytest.fixture
+def local_canvas():
+  roster_requests = []
+
+  class Handler(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+      url = urllib.parse.urlsplit(self.path)
+      if url.path.endswith("users"):
+        roster_requests.append(self.path)
+        body = roster_answer(urllib.parse.parse_qs(url.query))
+      else:
+        body = {"id": 1, "name": "A course", "course_code": "A"}
+      payload = json.dumps(body).encode("utf-8")
+      self.send_response(200)
+      self.send_header("Content-Type", "application/json")
+      self.send_header("Content-Length", str(len(payload)))
+      self.end_headers()
+      self.wfile.write(payload)
+
+    def log_message(self, *args):
+      pass
+
+  server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+  threading.Thread(target=server.serve_forever, daemon=True).start()
+  yield (canvasapi.Canvas(f"http://127.0.0.1:{server.server_address[1]}",
+                          "a token"),
+         roster_requests)
+  server.shutdown()
+
+@pytest.mark.filterwarnings("ignore:Canvas may respond unexpectedly")
+def test_course_students_leaves_the_cached_roster_whole(local_canvas):
+  canvas, roster_requests = local_canvas
+
+  students = course_students(canvas, 1, {})
+  assert [(s.id, s.email) for s in students] == [(1, "a@example.org")]
+
+  course = canvas.get_course(1)
+  everyone = course.get_users(include=["enrollments"])
+  assert sorted(user.id for user in everyone) == [1, 2]
+  assert len(roster_requests) == 1
 @
 
 [[assignment_progress]] puts the pieces together for one assignment and
