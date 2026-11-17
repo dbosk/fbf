@@ -152,9 +152,34 @@ look like a student who did nothing.
 The client is made by [[connect]], which the tests replace with one that
 returns the fake client of \cref{fake-fbf}.
 
+\subsection{Between runs}
+
+A launch per course and run was the largest single cost of a view, over two
+seconds (\cref{Cache}).
+The [[Viewer]] therefore keeps one client for all courses, since one pair of
+tokens serves them all, and starts it from the tokens of an earlier run,
+kept in the keyring (\cref{CacheTokens}).
+What the tokens do not say is the FBF course of a Canvas course, which only a
+launch through that course tells; the cache file keeps that map, so a course
+seen before needs no launch at all.
+A course not seen before is launched, as before, and its launch also renews
+the client's tokens.
+If the stored tokens have expired, the client's own renewal refreshes them
+or launches again (\cref{API}), through the course's safest assignment.
+
+The cache file is read when the viewer is made and written by [[close]],
+which the caller calls when it is done, together with the tokens.
+A viewer made without a Canvas host and token, as in the tests, keeps its
+cache in memory only and leaves the keyring alone.
+With [[refresh]], the viewer's cache serves nothing, for
+[[canvaslms --refresh-cache]].
+
 <<imports>>=
 import functools
 from fbf import canvas as fbfcanvas
+from fbf import cache as cache_module
+from fbf.api import FBF
+from fbf.launch import launch as lti_launch
 <<constants>>=
 NOT_OPENED = ("Nobody has opened this assignment in FeedbackFruits in this "
               "course round, so there is nothing to show.")
@@ -167,14 +192,28 @@ class Viewer:
     is the same for many submissions: one launch per course, and per
     activity its tasks, participants and their email addresses.  `errors`
     are the exceptions that mean FBF failed or changed, to be reported.
+
+    Between runs it keeps a cache file and the tokens, which `close`
+    writes; `refresh` makes the cache serve nothing.  `cache_path` replaces
+    the cache file's usual place.
     """
 
     errors = ERRORS
 
-    def __init__(self, canvas, canvas_url, canvas_token, connect=None):
+    def __init__(self, canvas, canvas_url, canvas_token, connect=None,
+                 refresh=False, cache_path=None):
         self.canvas = canvas
+        self.canvas_url = canvas_url
+        self.canvas_token = canvas_token
+        self.cache_path = cache_path
         self.connect = connect or functools.partial(
             fbfcanvas.connect, canvas_url, canvas_token)
+        self.persistent = bool(canvas_url and canvas_token)
+        self.cache = (cache_module.load_cache(canvas_url, canvas_token,
+                                              refresh, path=cache_path)
+                      if self.persistent
+                      else cache_module.Cache(refresh=refresh))
+        self.client = None
         self.courses = {}
         self.activities = {}
         self.students = {}
@@ -198,12 +237,40 @@ def course(self, course_id):
     return found
 
 def launch(self, course_id):
-    """Launch FBF for a Canvas course; return the client and activities."""
+    """Reach FBF for a Canvas course; return the client and activities."""
     assignments = list(self.canvas.get_course(course_id).get_assignments())
+    course_uuid = self.cache.courses.get(str(course_id))
+    if course_uuid is not None and self.stored_client(assignments):
+        return self.client, fbfcanvas.activities_by_code(self.client,
+                                                         course_uuid)
     fbf = self.connect(assignments)
     if fbf is None:
         return None, {}
+    fbf.cache = self.cache
+    self.client = fbf
+    self.cache.courses[str(course_id)] = fbf.login.course_uuid
     return fbf, fbfcanvas.activities_by_code(fbf, fbf.login.course_uuid)
+
+def stored_client(self, assignments):
+    """Return the client, from stored tokens if need be, or `None`."""
+    if self.client is None and self.persistent:
+        login = cache_module.stored_login(self.canvas_url)
+        order = fbfcanvas.launch_order(assignments)
+        if login is not None and order:
+            relaunch = functools.partial(lti_launch, self.canvas_url,
+                                         self.canvas_token,
+                                         order[0].course_id, order[0].id)
+            self.client = FBF(login, relaunch=relaunch, cache=self.cache)
+    return self.client
+
+def close(self):
+    """Keep the cache and the tokens for the next run."""
+    if not self.persistent:
+        return
+    if self.client is not None:
+        cache_module.store_login(self.canvas_url, self.client.login)
+    cache_module.save_cache(self.cache, self.canvas_url, self.canvas_token,
+                            self.cache_path)
 
 def activity(self, fbf, activity_id):
     """Return the `Activity` of `activity_id`, the same one every time."""
@@ -437,9 +504,18 @@ A few items, three of some 800 we looked at, have an empty [[type]] and no
 file at [[<id>/<name>.]] or [[<id>/<name>]]; for those we name the item and
 say that there is no file.
 
+A media object never changes: a new hand-in is a new item with a new media.
+So with a cache (\cref{Cache}) we keep the object under the path
+[[media/<id>]], which the cache's policies know, and the file in
+[[canvaslms]]'s encrypted attachment cache, under [[fbf:<id>]], which no
+Canvas id can be.
+The attachment cache keeps nothing when the user keeps submissions out of
+the cache, or when [[canvaslms]] has given it no key, as in the tests.
+
 <<constants>>=
 NO_FILE = "FeedbackFruits has no file for it"
 <<imports>>=
+import canvaslms.hacks.attachment_cache as attachment_cache
 import pathlib
 import urllib.parse
 from fbf.api import APIError, TIMEOUT
@@ -454,26 +530,46 @@ def media_base(api_url):
     return f"{parts.scheme}://{host}"
 
 
-def download_media(session, base, media_id, workdir, taken=None):
+def download_media(session, base, media_id, workdir, taken=None,
+                   cache=None):
     """Download the file of `media_id` into `workdir`; return its path.
 
     Returns `None` when the media service has no file for it.  `taken` are
     the file names already used by this view, which a new name avoids.
+    With a `cache`, the media object and the file are kept between runs.
     """
-    url = f"{base}/{media_id}"
-    info = checked(session.get(url, timeout=TIMEOUT), url).json()
+    info = media_info(session, base, media_id, cache)
     name, kind = media_field(info, "name"), media_field(info, "type")
     if not kind:
         return None
-    url = f"{base}/{media_id}/{urllib.parse.quote(name)}.{kind}"
-    response = checked(session.get(url, timeout=TIMEOUT), url)
     workdir = pathlib.Path(workdir)
     workdir.mkdir(parents=True, exist_ok=True)
     path = workdir / free_name(
         f"{pathlib.PurePath(name).name or 'file'}.{kind}",
         set() if taken is None else taken)
+    key = f"fbf:{media_id}"
+    if cache is not None and attachment_cache.restore_cached_attachment(
+            key, path):
+        return path
+    url = f"{base}/{media_id}/{urllib.parse.quote(name)}.{kind}"
+    response = checked(session.get(url, timeout=TIMEOUT), url)
     path.write_bytes(response.content)
+    if cache is not None:
+        attachment_cache.cache_attachment(
+            key, path, {"filename": path.name, "size": len(response.content)})
     return path
+
+
+def media_info(session, base, media_id, cache=None):
+    """Return the media service's object for `media_id`, cached if we can."""
+    key = f"media/{media_id}"
+    info = cache.lookup(key, {}) if cache is not None else None
+    if info is None:
+        url = f"{base}/{media_id}"
+        info = checked(session.get(url, timeout=TIMEOUT), url).json()
+        if cache is not None:
+            cache.store(key, {}, info)
+    return info
 @
 
 The media service is outside the API's schema checks (\cref{Schema}), so
@@ -612,7 +708,8 @@ def work_section(activity, users, workdir):
     for item in items:
         media = related_id(item, "media")
         path = media and download_media(activity.fbf.session, base, media,
-                                        workdir, taken)
+                                        workdir, taken,
+                                        getattr(activity.fbf, "cache", None))
         line = (f"- {attribute(item, 'title')} "
                 f"({attribute(item, 'category')}, "
                 f"{attribute(item, 'created-at')})")
@@ -879,6 +976,13 @@ We show the parts that the tasks call for, in the order a teacher reads
 them: what was handed in, what it earned, what others said about it, what
 the student said about others, and the student's own words.
 
+The parts do not depend on one another, so they are built at the same time,
+each in a thread, and a view takes as long as its slowest part rather than
+all of them together.
+The client already serves several threads (\cref{Parallel}), and so does
+the cache.
+The sections still come in the order of the parts.
+
 A part that fails costs only itself.
 One may fail where another does not: a group peer review, which we cannot
 read (\cref{Reviews}), still has a grade.
@@ -930,17 +1034,25 @@ sections, guarded by whether the activity has the task.
   lambda: [discussion_section(activity, users)])]
 <<constants>>=
 FAILED = "Could not fetch this from FeedbackFruits: {}"
+<<imports>>=
+import concurrent.futures
 <<functions>>=
 def each_part(parts):
-    """Return the sections of the `parts` that apply, errors in place."""
+    """Return the sections of the `parts` that apply, errors in place.
+
+    The parts are built at the same time, each in a thread of its own.
+    """
+    applying = [(title, build) for title, applies, build in parts
+                if applies]
     sections = []
-    for title, applies, build in parts:
-        if not applies:
-            continue
-        try:
-            sections += build()
-        except ERRORS as error:
-            sections.append(Section(title, FAILED.format(error)))
+    with concurrent.futures.ThreadPoolExecutor(
+            max(len(applying), 1)) as pool:
+        running = [(title, pool.submit(build)) for title, build in applying]
+        for title, future in running:
+            try:
+                sections += future.result()
+            except ERRORS as error:
+                sections.append(Section(title, FAILED.format(error)))
     return sections
 @
 
@@ -1150,6 +1262,109 @@ def test_viewer_without_an_fbf_assignment_to_launch_through(tmp_path):
                   connect=lambda assignments: None)
   assert view(viewer, course.assignments[0], 2, tmp_path) \
     == [Section(WORK_TITLE, NOT_OPENED)]
+@
+
+The parts are built at the same time.
+To show it, they wait for each other at a barrier: built one after
+another, the first would wait in vain and time out.
+
+<<test functions>>=
+def test_each_part_builds_the_parts_together():
+  together = threading.Barrier(3, timeout=5)
+  def part(name):
+    def build():
+      together.wait()
+      return [Section(name)]
+    return build
+  sections = each_part([(name, True, part(name)) for name in "ABC"])
+  assert [section.title for section in sections] == ["A", "B", "C"]
+@
+
+Last, the run after: a second viewer, as in the next run of the command,
+must find the tokens in the keyring and everything else in the cache file,
+and ask FBF for nothing, as long as the lists are younger than five
+minutes.
+Here the client must be the real [[FBF]], since the cache is in its [[get]],
+so we serve the fake world over a local web server (rung~2), the media
+server above extended with the API.
+The world's links are shortened for the review tests (\cref{fake-fbf});
+we give them FBF's real shapes, since the cache's policies go by them.
+The file is downloaded again, as the attachment cache has no key in the
+tests; everything else must come from the cache.
+
+<<test functions>>=
+import re
+import urllib.parse
+from fbf.launch import FBFLogin
+
+class FBFHandler(MediaHandler):
+  def do_GET(self):
+    parts = urllib.parse.urlsplit(self.path)
+    self.server.asked.append(parts.path)
+    query = dict(urllib.parse.parse_qsl(parts.query))
+    world = self.server.world
+    for path in (parts.path.lstrip("/"), parts.path):
+      if "filter[id]" in query and path in world.by_id:
+        ids = query["filter[id]"].split(",")
+        return self.reply(200, json.dumps({"data": [
+          resource for id, resource in world.by_id[path].items()
+          if id in ids]}).encode())
+      if path in world.documents:
+        return self.reply(200, json.dumps(world.documents[path]).encode())
+    super().do_GET()
+
+@pytest.fixture
+def fbf_server():
+  server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), FBFHandler)
+  server.asked = []
+  thread = threading.Thread(target=server.serve_forever, daemon=True)
+  thread.start()
+  yield server, f"http://127.0.0.1:{server.server_address[1]}"
+  server.shutdown()
+  server.server_close()
+
+LIST_NAMES = {"r": "reviews", "s": "ratings", "f": "reviewer_feedbacks"}
+
+def real_link(text):
+  text = re.sub(r"^/([rsf])/(a\d+)$", lambda m:
+                f"/v1/assignments/allocations/{m[2]}/{LIST_NAMES[m[1]]}",
+                text)
+  return re.sub(r"^/(t\d)/(\w+)$", r"/v1/assignments/tasks/\1/\2", text)
+
+def real_links(value):
+  if isinstance(value, dict):
+    return {key: real_links(item) for key, item in value.items()}
+  if isinstance(value, list):
+    return [real_links(item) for item in value]
+  return real_link(value) if isinstance(value, str) else value
+
+def test_a_second_run_needs_no_launch_and_no_request(fbf_server, tmp_path,
+                                                     memory_keyring):
+  server, url = fbf_server
+  server.world = world(url)
+  server.world.documents = {real_link(path): real_links(document)
+                            for path, document
+                            in server.world.documents.items()}
+  launches = []
+  def connect(assignments):
+    launches.append(1)
+    return FBF(FBFLogin("access", "refresh", url, course_uuid="c"))
+  opened = fbf_assignment(1, "opened")
+  canvas = SimpleNamespace(get_course=lambda id: Course([opened], STUDENTS))
+  def run(workdir):
+    viewer = Viewer(canvas, "canvas.example", "token", connect=connect,
+                    cache_path=tmp_path / "fbf.cache")
+    sections = view(viewer, opened, 2, workdir, score=8.0)
+    viewer.close()
+    return [(section.title, section.body) for section in sections]
+  first = run(tmp_path / "first")
+  assert cache_module.stored_login("canvas.example").refresh_token \
+    == "refresh"
+  server.asked.clear()
+  assert run(tmp_path / "second") == first
+  assert launches == [1]
+  assert [path for path in server.asked
+          if not path.startswith(("/m1", "/blob/"))] == []
 @
 
 A Canvas assignment that is not FBF's must cost nothing at all: no launch,
