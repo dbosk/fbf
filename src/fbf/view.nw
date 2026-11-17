@@ -148,6 +148,11 @@ launch, and wait for its timeouts, once per student.
 An assignment whose code is not among the activities has no activity in
 this round, and we say so rather than show nothing, since nothing would
 look like a student who did nothing.
+The course's activities may come from the cache, kept for days
+(\cref{Cache}), and an activity opened since is not in them.
+So a code we do not find makes us ask FBF once more for the course's
+activities, once per course and run, before we conclude that there is no
+activity.
 
 The client is made by [[connect]], which the tests replace with one that
 returns the fake client of \cref{fake-fbf}.
@@ -171,8 +176,10 @@ The cache file is read when the viewer is made and written by [[close]],
 which the caller calls when it is done, together with the tokens.
 A viewer made without a Canvas host and token, as in the tests, keeps its
 cache in memory only and leaves the keyring alone.
-With [[refresh]], the viewer's cache serves nothing, for
-[[canvaslms --refresh-cache]].
+With [[refresh]], for [[canvaslms --refresh-cache]], the viewer takes
+nothing from earlier runs: the cache serves nothing, each course is
+launched, which also brings new tokens and repairs a stale course map, and
+files are downloaded again.
 
 <<imports>>=
 import functools
@@ -194,15 +201,18 @@ class Viewer:
     are the exceptions that mean FBF failed or changed, to be reported.
 
     Between runs it keeps a cache file and the tokens, which `close`
-    writes; `refresh` makes the cache serve nothing.  `cache_path` replaces
-    the cache file's usual place.
+    writes; with `refresh` it takes nothing from earlier runs.
+    `cache_path` replaces
+    the cache file's usual place, and `relaunch` the launch that renews
+    stored tokens that cannot be refreshed (for the tests).
     """
 
     errors = ERRORS
 
     def __init__(self, canvas, canvas_url, canvas_token, connect=None,
-                 refresh=False, cache_path=None):
+                 refresh=False, cache_path=None, relaunch=lti_launch):
         self.canvas = canvas
+        self.relauncher = relaunch
         self.canvas_url = canvas_url
         self.canvas_token = canvas_token
         self.cache_path = cache_path
@@ -214,6 +224,7 @@ class Viewer:
                       if self.persistent
                       else cache_module.Cache(refresh=refresh))
         self.client = None
+        self.asked_again = set()
         self.courses = {}
         self.activities = {}
         self.students = {}
@@ -240,7 +251,8 @@ def launch(self, course_id):
     """Reach FBF for a Canvas course; return the client and activities."""
     assignments = list(self.canvas.get_course(course_id).get_assignments())
     course_uuid = self.cache.courses.get(str(course_id))
-    if course_uuid is not None and self.stored_client(assignments):
+    if course_uuid is not None and not self.cache.refresh \
+            and self.stored_client(assignments):
         return self.client, fbfcanvas.activities_by_code(self.client,
                                                          course_uuid)
     fbf = self.connect(assignments)
@@ -251,13 +263,25 @@ def launch(self, course_id):
     self.cache.courses[str(course_id)] = fbf.login.course_uuid
     return fbf, fbfcanvas.activities_by_code(fbf, fbf.login.course_uuid)
 
+def activities_after_miss(self, course_id):
+    """Ask FBF again for a course's activities, once per course and run."""
+    fbf, activities = self.course(course_id)
+    course_uuid = self.cache.courses.get(str(course_id))
+    if fbf is None or course_uuid is None or course_id in self.asked_again:
+        return activities
+    self.asked_again.add(course_id)
+    self.cache.forget(f"v1/courses/{course_uuid}/activities")
+    activities = fbfcanvas.activities_by_code(fbf, course_uuid)
+    self.courses[course_id] = (fbf, activities)
+    return activities
+
 def stored_client(self, assignments):
     """Return the client, from stored tokens if need be, or `None`."""
     if self.client is None and self.persistent:
         login = cache_module.stored_login(self.canvas_url)
         order = fbfcanvas.launch_order(assignments)
         if login is not None and order:
-            relaunch = functools.partial(lti_launch, self.canvas_url,
+            relaunch = functools.partial(self.relauncher, self.canvas_url,
                                          self.canvas_token,
                                          order[0].course_id, order[0].id)
             self.client = FBF(login, relaunch=relaunch, cache=self.cache)
@@ -444,6 +468,69 @@ def test_student_users_falls_back_to_everyone_by_address():
                        {}) == set()
 @
 
+\subsection{Remembering the student}
+
+One request stood out when we timed a view with the cache in place: the
+list of the activity's progresses, which took FBF 0.9 to 1.2 seconds for
+the 177 progresses of our test course, against 0.05 seconds for one
+progress by its id, with the same attributes.
+The view needs the list for two things only: to find the student among the
+participants, and the student's own progress for the grade.
+Both answers are stable.
+The FBF users who are a Canvas student stay so, and a participant's
+progress keeps its id while its content changes.
+So the viewer remembers them, in the cache file under paths of its own
+([[fbf/students/]]\ldots, [[fbf/progress-ids/]]\ldots), kept as long as
+other details and as personal as the rest.
+A view of a student seen before then fetches the student's progress by
+its id, and never the list.
+The progresses taken from the list are also kept as the answers to those
+requests by id, so a view within five minutes asks for nothing.
+What it may miss is a second identity created in FBF since, until the
+details expire or [[--refresh-cache]].
+
+<<constants>>=
+STUDENT_PATH = "fbf/students/{course}/{user}"
+PROGRESS_PATH = "fbf/progress-ids/{activity}/{user}"
+<<viewer methods>>=
+def users_of(self, activity, course_id, student):
+    """Return the ids of the FBF users who are `student`, remembered."""
+    path = STUDENT_PATH.format(course=course_id, user=student.id)
+    known = self.remembered(path)
+    self.prefetch(activity, progresses=not known)
+    if known:
+        return set(known)
+    users = student_users(activity.fbf, activity.users, student, self.emails)
+    if users:
+        self.remember(path, sorted(users))
+    return users
+
+def progresses_of(self, activity, users, student):
+    """Return the progresses of `users` in `activity`, by remembered ids."""
+    path = PROGRESS_PATH.format(activity=activity.id, user=student.id)
+    ids = self.remembered(path)
+    if ids:
+        return [activity.fbf.get(f"v1/progresses/{id}").resource
+                for id in ids]
+    mine = [progress for progress in activity.progresses
+            if related_id(progress, "actor") in users]
+    if mine:
+        self.remember(path, [progress["id"] for progress in mine])
+    for progress in mine:
+        self.cache.store(f"v1/progresses/{progress['id']}", {},
+                         {"data": progress})
+    return mine
+
+def remembered(self, path):
+    """Return what the viewer remembered under `path`, or `None`."""
+    document = self.cache.lookup(path, {})
+    return None if document is None else document["data"]
+
+def remember(self, path, value):
+    """Remember `value` under `path`, in the cache file."""
+    self.cache.store(path, {}, {"data": value})
+@
+
 The student comes from Canvas, from the course's list of students with
 their addresses, which the grade breakdown fetches the same way and
 [[canvaslms]] keeps in its cache (\cref{Progress}).
@@ -548,8 +635,8 @@ def download_media(session, base, media_id, workdir, taken=None,
         f"{pathlib.PurePath(name).name or 'file'}.{kind}",
         set() if taken is None else taken)
     key = f"fbf:{media_id}"
-    if cache is not None and attachment_cache.restore_cached_attachment(
-            key, path):
+    if cache is not None and not cache.refresh and \
+            attachment_cache.restore_cached_attachment(key, path):
         return path
     url = f"{base}/{media_id}/{urllib.parse.quote(name)}.{kind}"
     response = checked(session.get(url, timeout=TIMEOUT), url)
@@ -735,10 +822,14 @@ The Canvas score is the submission's own, which [[canvaslms]] already has.
 <<constants>>=
 GRADE_TITLE = "FeedbackFruits grade"
 <<functions>>=
-def grade_section(activity, users, assignment, student, score):
-    """Return the `Section` of the grade breakdown of `users`."""
-    mine = [progress for progress in activity.progresses
-            if related_id(progress, "actor") in users]
+def grade_section(activity, users, assignment, student, score, mine=None):
+    """Return the `Section` of the grade breakdown of `users`.
+
+    `mine`, if given, are the progresses of `users`, fetched before.
+    """
+    if mine is None:
+        mine = [progress for progress in activity.progresses
+                if related_id(progress, "actor") in users]
     if not mine:
         return Section(GRADE_TITLE, "No progress in FeedbackFruits.")
     progress = max(mine, key=progress_module.preference)
@@ -787,6 +878,9 @@ we pass one for each and pay only for the student's allocations, a handful
 of requests instead of hundreds.
 The list of allocations itself they take from the [[Activity]], which
 fetches it once for all students.
+The four fetches, reviews and feedback for each direction, do not depend on
+one another, so they run at the same time, as the parts do
+(\cref{ViewTogether}).
 With the reviews come the ratings of them: those the student gave the
 reviews received, and those the reviewees gave the student's reviews.
 
@@ -798,19 +892,21 @@ from fbf import reviews as review_module
 <<functions>>=
 def review_sections(activity, users):
     """Return the `Section`s of the reviews that `users` got and gave."""
-    sections = []
-    for title, role, other in [(RECEIVED_TITLE, "allocable", "reviewer"),
-                               (GIVEN_TITLE, "actor", "reviewee")]:
-        keep = in_role(users, role)
-        reviews = review_module.fetch_reviews(
-            activity.fbf, activity.task, "", keep=keep,
-            allocations=activity.allocations)
-        feedbacks = review_module.fetch_feedback(
-            activity.fbf, activity.task, "", keep=keep,
-            allocations=activity.allocations)
-        sections.append(Section(title, reviews_text(reviews, feedbacks,
-                                                    other)))
-    return sections
+    roles = [(RECEIVED_TITLE, "allocable", "reviewer"),
+             (GIVEN_TITLE, "actor", "reviewee")]
+    allocations = activity.allocations
+    with concurrent.futures.ThreadPoolExecutor(2 * len(roles)) as pool:
+        fetched = [(title, other,
+                    pool.submit(review_module.fetch_reviews, activity.fbf,
+                                activity.task, "", keep=in_role(users, role),
+                                allocations=allocations),
+                    pool.submit(review_module.fetch_feedback, activity.fbf,
+                                activity.task, "", keep=in_role(users, role),
+                                allocations=allocations))
+                   for title, role, other in roles]
+        return [Section(title, reviews_text(reviews.result(),
+                                            feedbacks.result(), other))
+                for title, other, reviews, feedbacks in fetched]
 
 
 def in_role(users, role):
@@ -855,6 +951,8 @@ Let's verify both directions on the peer review of \cref{fake-fbf}, as
 seen by Ada (user [[u2]]): Bo and Cy reviewed her and she rated both
 reviews; she was to review Cy but never started.
 The lists asked for must be those of her allocations only.
+The two directions are fetched together: each asks for the criteria, and
+the fake holds those requests until both have come.
 
 <<test functions>>=
 from test_reviews import course_with_a_peer_review, lists_asked
@@ -875,6 +973,19 @@ def test_review_sections_show_both_directions():
     "  - Rating of the review: 5, Thanks",
     "- Cy", "  - Overall", "    - Fine", "  - Rating of the review: 3"]
   assert given.body == "None."
+
+class CriteriaTogetherFBF(FakeFBF):
+  def get(self, path, **params):
+    if path == "/t1/criteria":
+      self.together.wait()
+    return super().get(path, **params)
+
+def test_both_directions_of_the_reviews_are_fetched_together():
+  fbf, activity = peer_review_activity()
+  fbf.__class__ = CriteriaTogetherFBF
+  fbf.together = threading.Barrier(2, timeout=5)
+  received, given = review_sections(activity, {"u2"})
+  assert received.body.startswith("- Bo")
 
 def test_review_sections_ask_only_for_the_students_allocations():
   fbf, activity = peer_review_activity()
@@ -976,12 +1087,71 @@ We show the parts that the tasks call for, in the order a teacher reads
 them: what was handed in, what it earned, what others said about it, what
 the student said about others, and the student's own words.
 
+When the student is looked for, the viewer fetches the activity's lists at
+the same time ([[prefetch]]): the progresses, if finding the student needs
+them (\cref{ViewStudent}), and those of the parts the activity has, the
+work handed in, the allocations and the reflections.
+Fetched one after the other, by whoever needs them first, they were a
+chain of round trips; together they cost one.
+A list that fails here is left to its part, which asks again and reports
+the error in its place.
+
+<<constants>>=
+PREFETCHED = [("submissions", SUBMIT_TASK),
+              ("allocations", review_module.REVIEW_TASK),
+              ("reflections", review_module.REFLECT_TASK)]
+<<viewer methods>>=
+def prefetch(self, activity, progresses=True):
+    """Fetch the lists of `activity` that the view will read, together.
+
+    The progresses only if `progresses`.
+    """
+    names = ["progresses"] if progresses else []
+    names += [name for name, task in PREFETCHED if task in activity.task]
+    def fetch(name):
+        try:
+            getattr(activity, name)
+        except ERRORS:
+            pass
+    with concurrent.futures.ThreadPoolExecutor(len(names)) as pool:
+        list(pool.map(fetch, names))
+@
+
+Let's verify that the lists are fetched together: the fake world holds each
+list request at a barrier until all four have come, which they never would
+one after the other.
+
+<<test functions>>=
+class TogetherFBF(FakeFBF):
+  LISTS = {"v1/progresses", "/t5/submissions", "/t1/allocations",
+           "/t3/reflections"}
+  def get(self, path, **params):
+    if path in self.LISTS:
+      self.together.wait()
+    return super().get(path, **params)
+
+def test_the_lists_of_an_activity_are_fetched_together(media_server):
+  fbf = world(media_server)
+  fbf.__class__ = TogetherFBF
+  fbf.together = threading.Barrier(4, timeout=5)
+  viewer, _, _ = viewer_of(fbf)
+  activity = viewer.activity(fbf, "act")
+  viewer.prefetch(activity)
+  assert all(name in vars(activity) for name in
+             ["progresses", "submissions", "allocations", "reflections"])
+@
+
 The parts do not depend on one another, so they are built at the same time,
 each in a thread, and a view takes as long as its slowest part rather than
 all of them together.
 The client already serves several threads (\cref{Parallel}), and so does
 the cache.
 The sections still come in the order of the parts.
+The client limits the requests in flight however many parts ask
+(\cref{Parallel}).
+One cost of the threads: a Ctrl-C reaches the caller only when the parts
+that are running have finished, since a thread cannot be stopped in the
+middle of a request.
 
 A part that fails costs only itself.
 One may fail where another does not: a group peer review, which we cannot
@@ -1006,12 +1176,14 @@ def sections(self, submission, workdir):
         return []
     fbf, activities = self.course(assignment.course_id)
     if code not in activities:
+        activities = self.activities_after_miss(assignment.course_id)
+    if code not in activities:
         return [Section(WORK_TITLE, NOT_OPENED)]
     activity = self.activity(fbf, activities[code])
     student = self.student(assignment.course_id, submission.user_id)
     if student is None:
         return [Section(WORK_TITLE, NOT_A_STUDENT)]
-    users = student_users(fbf, activity.users, student, self.emails)
+    users = self.users_of(activity, assignment.course_id, student)
     if not users:
         return [Section(WORK_TITLE, NOT_TAKEN_PART)]
     return each_part(<<the parts of [[activity]]>>)
@@ -1025,7 +1197,8 @@ sections, guarded by whether the activity has the task.
   lambda: [work_section(activity, users, workdir)]),
  (GRADE_TITLE, True,
   lambda: [grade_section(activity, users, assignment, student,
-                         submission.score)]),
+                         submission.score,
+                         self.progresses_of(activity, users, student))]),
  (RECEIVED_TITLE, review_module.REVIEW_TASK in activity.task,
   lambda: review_sections(activity, users)),
  (REFLECTION_TITLE, review_module.REFLECT_TASK in activity.task,
@@ -1338,13 +1511,20 @@ def real_links(value):
     return [real_links(item) for item in value]
   return real_link(value) if isinstance(value, str) else value
 
+def real_world(url):
+  """The world of the viewer's tests, with FBF's real link shapes."""
+  served = world(url)
+  served.documents = {real_link(path): real_links(document)
+                      for path, document in served.documents.items()}
+  for progress in served.documents["v1/progresses"]["data"]:
+    served.documents[f"v1/progresses/{progress['id']}"] = {"data": progress}
+  return served
+
 def test_a_second_run_needs_no_launch_and_no_request(fbf_server, tmp_path,
-                                                     memory_keyring):
+                                                     memory_keyring,
+                                                     personal_data_allowed):
   server, url = fbf_server
-  server.world = world(url)
-  server.world.documents = {real_link(path): real_links(document)
-                            for path, document
-                            in server.world.documents.items()}
+  server.world = real_world(url)
   launches = []
   def connect(assignments):
     launches.append(1)
@@ -1364,7 +1544,182 @@ def test_a_second_run_needs_no_launch_and_no_request(fbf_server, tmp_path,
   assert run(tmp_path / "second") == first
   assert launches == [1]
   assert [path for path in server.asked
-          if not path.startswith(("/m1", "/blob/"))] == []
+          if path != "/m1/lab.py" and not path.startswith("/blob/")] == []
+@
+
+Once the lists are older than five minutes, the next run asks for them
+again, but not for the slow list of all progresses: it remembers which
+users and progresses are the student's (\cref{ViewStudent}) and asks for
+those progresses by id.
+We age the kept lists in the file rather than wait.
+
+<<test functions>>=
+def test_a_student_seen_before_costs_no_list_of_progresses(
+    fbf_server, tmp_path, memory_keyring, personal_data_allowed):
+  server, url = fbf_server
+  server.world = real_world(url)
+  connect = lambda assignments: FBF(FBFLogin("a", "r", url,
+                                             course_uuid="c"))
+  opened = fbf_assignment(1, "opened")
+  canvas = SimpleNamespace(get_course=lambda id: Course([opened], STUDENTS))
+  path = tmp_path / "fbf.cache"
+  def run(workdir):
+    viewer = Viewer(canvas, "canvas.example", "token", connect=connect,
+                    cache_path=path)
+    sections = view(viewer, opened, 2, workdir, score=8.0)
+    viewer.close()
+    return [(section.title, section.body) for section in sections]
+  first = run(tmp_path / "one")
+  kept = cache_module.load_cache("canvas.example", "token", path=path)
+  for entry in kept.entries.values():
+    if cache_module.policy_of(entry["path"]).ttl == cache_module.LIST_TTL:
+      entry["fetched"] -= cache_module.LIST_TTL + 1
+  cache_module.save_cache(kept, "canvas.example", "token", path)
+  server.asked.clear()
+  assert run(tmp_path / "two") == first
+  assert "/v1/progresses" not in server.asked
+  assert sorted(p for p in server.asked if p.startswith("/v1/progresses/")) \
+    == ["/v1/progresses/p2", "/v1/progresses/p3"]
+@
+
+With [[refresh]] the next run takes nothing from the first: it launches
+again, and asks FBF for everything again.
+
+<<test functions>>=
+def test_a_refreshing_run_launches_and_asks_again(fbf_server, tmp_path,
+                                                  memory_keyring,
+                                                  personal_data_allowed):
+  server, url = fbf_server
+  server.world = real_world(url)
+  launches = []
+  def connect(assignments):
+    launches.append(1)
+    return FBF(FBFLogin("access", "refresh", url, course_uuid="c"))
+  opened = fbf_assignment(1, "opened")
+  canvas = SimpleNamespace(get_course=lambda id: Course([opened], STUDENTS))
+  for refresh in (False, True):
+    viewer = Viewer(canvas, "canvas.example", "token", connect=connect,
+                    cache_path=tmp_path / "fbf.cache", refresh=refresh)
+    view(viewer, opened, 2, tmp_path / str(refresh))
+    viewer.close()
+  assert launches == [1, 1]
+  assert server.asked.count("/v1/progresses") == 2
+@
+
+An activity opened after the course's activities were kept is not in the
+kept list.
+The next run must ask FBF again when it misses the code, find the new
+activity, and not say that nobody opened it; and it must ask only once,
+however many submissions of other unopened assignments it shows.
+
+<<test functions>>=
+def test_an_activity_opened_since_is_found_by_asking_again(
+    fbf_server, tmp_path, memory_keyring, personal_data_allowed):
+  server, url = fbf_server
+  server.world = real_world(url)
+  connect = lambda assignments: FBF(FBFLogin("a", "r", url,
+                                             course_uuid="c"))
+  opened, later = fbf_assignment(1, "opened"), fbf_assignment(2, "later")
+  never = fbf_assignment(3, "never")
+  canvas = SimpleNamespace(get_course=lambda id: Course(
+    [opened, later, never], STUDENTS))
+  def viewer():
+    return Viewer(canvas, "canvas.example", "token", connect=connect,
+                  cache_path=tmp_path / "fbf.cache")
+  first = viewer()
+  view(first, opened, 2, tmp_path / "one")
+  first.close()
+  documents = server.world.documents
+  documents["v1/courses/c/activities"]["data"].append(
+    {"type": "activities", "id": "act",
+     "relationships": {"placement": ref("lti/placement", "pl2")}})
+  documents["v1/courses/c/activities"]["included"].append(
+    {"type": "lti/placement", "id": "pl2", "attributes": {"code": "later"}})
+  server.asked.clear()
+  second = viewer()
+  assert view(second, later, 2, tmp_path / "two")[0].title == WORK_TITLE
+  assert view(second, later, 2, tmp_path / "two")[0].body != NOT_OPENED
+  assert view(second, never, 2, tmp_path / "two") \
+    == [Section(WORK_TITLE, NOT_OPENED)]
+  assert view(second, never, 2, tmp_path / "two") \
+    == [Section(WORK_TITLE, NOT_OPENED)]
+  assert server.asked.count("/v1/courses/c/activities") == 1
+@
+
+Stored tokens may have run out.
+Then the client's renewal tries the refresh token, which FBF refuses, and
+launches again through the course's safest assignment; the new tokens are
+the ones kept for the next run.
+The server refuses the old token and the refresh, and the launch is a
+stand-in, since a real one needs Canvas.
+
+<<test functions>>=
+class StrictFBFHandler(FBFHandler):
+  def do_GET(self):
+    if self.headers.get("Authorization") == "Bearer old":
+      return self.reply(401, b"expired")
+    super().do_GET()
+  def do_POST(self):
+    self.reply(401, b"refresh refused")
+
+def test_expired_stored_tokens_are_renewed_by_a_launch(tmp_path,
+                                                      memory_keyring,
+                                                      personal_data_allowed):
+  server = http.server.ThreadingHTTPServer(("127.0.0.1", 0),
+                                           StrictFBFHandler)
+  server.asked = []
+  threading.Thread(target=server.serve_forever, daemon=True).start()
+  url = f"http://127.0.0.1:{server.server_address[1]}"
+  try:
+    server.world = real_world(url)
+    opened = fbf_assignment(1, "opened")
+    canvas = SimpleNamespace(get_course=lambda id: Course([opened], STUDENTS))
+    cache_module.save_cache(cache_module.Cache(courses={"5": "c"}),
+                            "canvas.example", "token", tmp_path / "fbf.cache")
+    cache_module.store_login("canvas.example", FBFLogin("old", "old", url))
+    relaunches = []
+    def relaunch(canvas_url, canvas_token, course_id, assignment_id):
+      relaunches.append((course_id, assignment_id))
+      return FBFLogin("new", "new", url, course_uuid="c")
+    viewer = Viewer(canvas, "canvas.example", "token",
+                    connect=lambda assignments: pytest.fail("launched"),
+                    cache_path=tmp_path / "fbf.cache", relaunch=relaunch)
+    titles = [s.title for s in view(viewer, opened, 2, tmp_path / "w")]
+    viewer.close()
+  finally:
+    server.shutdown()
+    server.server_close()
+  assert titles[:2] == [WORK_TITLE, GRADE_TITLE]
+  assert relaunches == [(5, 1)]
+  assert cache_module.stored_login("canvas.example").access_token == "new"
+@
+
+The file a student handed in is kept in [[canvaslms]]'s attachment cache,
+which we give a key and a directory of the test's own: the second download
+of the same media asks the media service for nothing, neither the object,
+which our cache keeps, nor the file.
+
+<<test functions>>=
+from cryptography.fernet import Fernet
+
+@pytest.fixture
+def attachment_store(tmp_path, monkeypatch):
+  monkeypatch.setattr(attachment_cache, "CACHE_DIR", tmp_path / "attachments")
+  monkeypatch.setattr(attachment_cache, "INDEX_FILE",
+                      tmp_path / "attachments" / "index.json")
+  monkeypatch.setattr(attachment_cache, "_fernet", None)
+  attachment_cache.set_fernet(Fernet(Fernet.generate_key()))
+
+def test_a_file_handed_in_is_downloaded_once(fbf_server, tmp_path,
+                                             attachment_store):
+  server, url = fbf_server
+  server.world = real_world(url)
+  session, cache = requests.Session(), cache_module.Cache()
+  first = download_media(session, url, "m1", tmp_path / "one", cache=cache)
+  server.asked.clear()
+  again = download_media(session, url, "m1", tmp_path / "two", cache=cache)
+  assert again.read_text() == first.read_text() == "print('hello')\n"
+  assert server.asked == []
 @
 
 A Canvas assignment that is not FBF's must cost nothing at all: no launch,
