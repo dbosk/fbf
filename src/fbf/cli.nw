@@ -136,6 +136,10 @@ def test_commands_get_the_cache_and_it_is_saved(tmp_path, monkeypatch):
     fbf.cli.reporting_errors(command)({}, object(), args)
   assert fbf.cache.load_cache("https://canvas.example", "token").courses \
     == {"5": "uuid-5"}
+  refreshing = types.SimpleNamespace(refresh_cache=True)
+  fbf.cli.reporting_errors(lambda config, canvas, args: None)(
+    {}, object(), refreshing)
+  assert refreshing.fbf_cache.refresh
   def local(config, canvas, args):
     assert not hasattr(args, "fbf_cache")
   fbf.cli.reporting_errors(local)({}, None, types.SimpleNamespace())

@@ -138,6 +138,29 @@ def connect(canvas_url, canvas_token, assignments, cache=None):
     return None
 @
 
+The commands' clients get the cache through [[fbf_activities]]
+(\cref{Cache}).
+Let's verify that the client it yields has it, with a stand-in for the
+launch, which needs Canvas, and the course's activities already in the
+cache, so that no request is sent.
+
+<<test functions>>=
+from fbf.cache import Cache
+from fbf.launch import FBFLogin
+
+def test_the_clients_of_the_commands_get_the_cache(monkeypatch):
+  monkeypatch.setattr("fbf.canvas.launch", lambda *args: FBFLogin(
+    "a", "r", "https://api.example", course_uuid="c"))
+  cache = Cache()
+  cache.store("v1/courses/c/activities", {"include": "placement"},
+              {"data": []})
+  opened = fbf_assignment("code", submitted=True)
+  opened.id, opened.course_id = 1, 5
+  (assignment, fbf, activity), = fbf_activities("https://canvas.example",
+                                                "token", [opened], cache)
+  assert fbf.cache is cache and activity is None
+@
+
 
 \section{Naming assignments in the output}
 

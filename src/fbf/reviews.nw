@@ -79,7 +79,8 @@ requires("submission-review-view-tasks",
          attributes=["reviewer-feedback-enabled"])
 requires("reflect-tasks", relationships=["reflections"])
 requires("assignments/allocation",
-         attributes=["reviews-count", "ratings-count"],
+         attributes=["reviews-count", "ratings-count",
+                     "reviews-published-at", "ratings-published-at"],
          relationships=["actor", "allocable", "reviews", "ratings",
                         "reviewer-feedback"])
 for kind in ["assignments/criterion", "assignments/rubric-criterion"]:
@@ -1011,8 +1012,8 @@ relationship.
 With a cache (\cref{Cache}), a list kept from before must be used only
 while its allocation says the same.
 Here the client and the cache are the real ones and only the session is
-made up, logging what it is asked; a new review on the allocation must
-make the list be fetched again.
+made up, logging what it is asked; a new count or publication time on the
+allocation must make the list be fetched again.
 
 <<test functions>>=
 from types import SimpleNamespace
@@ -1039,6 +1040,9 @@ def test_a_kept_list_is_fetched_again_when_its_allocation_changes():
   pair["attributes"]["reviews-count"] = 2
   allocation_lists(fbf, [pair], wanted)
   assert len(asked) == 2
+  pair["attributes"]["reviews-published-at"] = "2026-11-18T10:00:00Z"
+  allocation_lists(fbf, [pair], wanted)
+  assert len(asked) == 3
 @
 
 <<test functions>>=
