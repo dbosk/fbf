@@ -12,6 +12,7 @@ fbf.pdf: ../src/fbf/discussions.tex
 fbf.pdf: ../src/fbf/reviews.tex
 fbf.pdf: ../src/fbf/progress.tex
 fbf.pdf: ../src/fbf/view.tex
+fbf.pdf: ../src/fbf/cache.tex
 fbf.pdf: ../src/fbf/cli.tex
 fbf.pdf: ../src/fbf/testing.tex
 

@@ -1,0 +1,528 @@
+\chapter{Keeping FBF data between runs}
+\label{Cache}
+
+Every run of a command used to start from nothing: a launch, then every
+request again.
+For one student in [[canvaslms submissions view]] (\cref{View}) that came
+to some 40 requests and 7 to 12 seconds, of which the launch alone, four
+hops one after the other, took more than two.
+Most of it is the same as last time: the activity's tasks, the criteria of
+a review, the participants and their addresses, the files handed in.
+This chapter keeps that between runs, in two places: the data in an
+encrypted cache file, the tokens in the system keyring.
+
+The data does not all age alike, and the cache is built on that.
+\begin{description}
+\item[Lists] say what there is now: the participants' progresses, the work
+  handed in, the review allocations, the reflections, the posts.
+  They change while the students work, and a teacher looks at them to see
+  what is new.
+  We keep them for five minutes, which makes a run over many submissions,
+  or one right after another, cheap, and leaves a view almost always
+  fresh.
+\item[Details] are what the lists point to: the tasks of an activity, the
+  criteria and their levels, a user's name and addresses, a file.
+  They hardly change, so we keep them for as long as [[canvaslms]] keeps
+  its own objects, a week by default ([[DEFAULT_CACHE_TTL_DAYS]]).
+\item[Validated details] are the reviews and ratings of an allocation.
+  They do change, but the allocation, which is in a list, says how many
+  there are and when they were last published.
+  So a detail is used only while the counts and times it was fetched with
+  are still those of the fresh allocation: a new or republished review or
+  rating makes the list be fetched again at once, without waiting a week.
+  The reviewee's feedback on a review has no such count on the
+  allocation, so it is a list, kept five minutes.
+\end{description}
+What is in none of these classes is not cached at all.
+That is the safe default for an endpoint we add later and forget to
+classify: it costs time, not correctness.
+
+The cache sits under the client's [[get]] (\cref{API}), so every command
+gains, not only the view: [[fbf reviews]] asks for some 800 lists per
+activity (\cref{Reviews}), which a second run within a week mostly takes
+from the cache.
+
+<<[[cache.py]]>>=
+"""Keep FBF data between runs: a cache file and tokens in the keyring."""
+
+<<imports>>
+
+<<classes>>
+
+<<constants>>
+
+<<functions>>
+@
+
+<<test [[cache.py]]>>=
+import pytest
+
+from fbf.cache import *
+
+<<test functions>>
+@
+
+
+\section{The policies}
+
+A policy names the paths it applies to, how long their documents are good
+for, and whether they are personal data, which decides what may go into the
+cache file (\cref{CacheFile}).
+Paths are matched on the part after the host, so a link that FBF gives in
+full and a path we write ourselves match alike.
+The first policy that matches decides.
+
+<<imports>>=
+import dataclasses
+import re
+from canvaslms.hacks.canvasapi import DEFAULT_CACHE_TTL_DAYS
+<<constants>>=
+LIST_TTL = 5 * 60
+DETAIL_TTL = DEFAULT_CACHE_TTL_DAYS * 24 * 60 * 60
+<<classes>>=
+@dataclasses.dataclass(frozen=True)
+class Policy:
+    """How long the documents of the paths matching `pattern` are good for."""
+
+    pattern: str
+    ttl: float
+    personal: bool
+@
+
+The table follows the classes above.
+The course's activities, the activity with its tasks, the criteria and
+their levels, and the choices of a quiz question are course content, not
+personal data.
+Everything about participants is personal: their progresses, their work,
+their reviews, their names and addresses.
+The media service's objects are in the table under [[media/]], a path of
+our own (\cref{ViewWork}), since that service is not the API.
+
+<<constants>>=
+POLICIES = [
+    Policy(r"^v1/courses/[^/]+/activities$", LIST_TTL, False),
+    Policy(r"^v1/activities/[^/]+$", DETAIL_TTL, False),
+    Policy(r"/criteria$", DETAIL_TTL, False),
+    Policy(r"^v1/assignments/criterion_options$", DETAIL_TTL, False),
+    Policy(r"^v1/questions/choices$", DETAIL_TTL, False),
+    Policy(r"^v1/progresses$", LIST_TTL, True),
+    Policy(r"/(submissions|allocations|reflections|reviewer_feedbacks)$",
+           LIST_TTL, True),
+    Policy(r"/(annotations|fragments|comments|questions|answers)$",
+           LIST_TTL, True),
+    Policy(r"^v1/lti/grades$", LIST_TTL, True),
+    Policy(r"^v1/users$", DETAIL_TTL, True),
+    Policy(r"^v1/people/[^/]+/emails$", DETAIL_TTL, True),
+    Policy(r"/(reviews|ratings)$", DETAIL_TTL, True),
+    Policy(r"^media/[^/]+$", DETAIL_TTL, True),
+]
+<<imports>>=
+import urllib.parse
+<<functions>>=
+def relative(path):
+    """Return the path of `path` after the host, and its query."""
+    parts = urllib.parse.urlsplit(path)
+    return parts.path.lstrip("/"), dict(urllib.parse.parse_qsl(parts.query))
+
+
+def policy_of(path):
+    """Return the `Policy` for `path`, or `None` if it is not cached."""
+    path, _ = relative(path)
+    return next((policy for policy in POLICIES
+                 if re.search(policy.pattern, path)), None)
+@
+
+Let's verify the classes on paths as the fetchers send them: the lists are
+short-lived, the details long-lived, and a path we never classified is not
+cached.
+
+<<test functions>>=
+def test_policies_classify_the_paths_we_fetch():
+  api = "https://api.eu.feedbackfruits.com/"
+  assert policy_of("v1/progresses").ttl == LIST_TTL
+  assert policy_of(api + "v1/assignments/tasks/t1/allocations").ttl \
+    == LIST_TTL
+  assert policy_of(api + "v1/assignments/allocations/a1/reviews").ttl \
+    == DETAIL_TTL
+  assert policy_of("v1/activities/a1").personal is False
+  assert policy_of("v1/people/u1/emails").personal is True
+  assert policy_of("v1/users/current") is None
+  assert policy_of("v1/notifications") is None
+@
+
+
+\section{The cache}
+
+A [[Cache]] maps a request, its relative path and its query, to the
+document FBF returned, with the time it was fetched and the validator it
+was fetched with.
+It answers a request only while the policy's time has not run out and the
+validator is the same, and it hands out a copy, so that a caller who
+changes a document does not change the cache.
+The clock is a parameter, [[now]], so that the tests can move it.
+The fetchers call the cache from several threads (\cref{Parallel}), so a
+lock guards the dictionary.
+
+With [[refresh]], the cache answers nothing but still stores what is
+fetched, as [[canvaslms --refresh-cache]] does for Canvas: the user asked
+for fresh data, and having fetched it, we keep it.
+
+The validator is stored as it comes back from JSON, since the file stores
+it as JSON: a tuple saved would come back as a list and never equal the
+tuple again.
+
+A request for a batch of ids, [[filter[id]=a,b,c]], is not kept: the client
+keeps each resource of it as the request for its own id (\cref{API}),
+which the next batch, of other company, can use.
+
+<<imports>>=
+import copy
+import json
+import threading
+import time
+<<classes>>=
+class Cache:
+    """FBF documents by request, with their age and validators."""
+
+    def __init__(self, entries=None, courses=None, now=time.time,
+                 refresh=False):
+        self.entries = dict(entries or {})
+        self.courses = dict(courses or {})
+        self.now = now
+        self.refresh = refresh
+        self.lock = threading.Lock()
+
+    <<cache methods>>
+<<functions>>=
+def cache_key(path, params):
+    """Return the key of a request: its relative path and its query."""
+    path, query = relative(path)
+    return json.dumps([path, sorted({**query, **params}.items())])
+
+
+def as_json(value):
+    """Return `value` as it would come back from JSON."""
+    return json.loads(json.dumps(value))
+<<cache methods>>=
+def lookup(self, path, params, validator=None):
+    """Return the cached document of a request, or `None`."""
+    policy = policy_of(path)
+    if policy is None or self.refresh:
+        return None
+    with self.lock:
+        entry = self.entries.get(cache_key(path, params))
+    if entry is None or self.now() - entry["fetched"] > policy.ttl:
+        return None
+    if entry["validator"] != as_json(validator):
+        return None
+    return copy.deepcopy(entry["document"])
+
+def store(self, path, params, document, validator=None):
+    """Keep the `document` of a request, if its path is cached."""
+    if policy_of(path) is None or "," in params.get("filter[id]", ""):
+        return
+    entry = {"path": relative(path)[0], "fetched": self.now(),
+             "validator": as_json(validator),
+             "document": copy.deepcopy(document)}
+    with self.lock:
+        self.entries[cache_key(path, params)] = entry
+@
+
+Let's verify the three classes, with a clock we move by hand.
+A list is served for five minutes, a detail for days, a validated detail
+only with the same validator; [[refresh]] serves nothing but keeps what it
+gets.
+
+<<test functions>>=
+class Clock:
+  def __init__(self):
+    self.time = 1000.0
+  def __call__(self):
+    return self.time
+
+DOCUMENT = {"data": [{"type": "progresses", "id": "p1"}]}
+
+def test_lists_live_five_minutes_and_details_days():
+  clock = Clock()
+  cache = Cache(now=clock)
+  cache.store("v1/progresses", {"activity_id": "a"}, DOCUMENT)
+  cache.store("v1/activities/a", {"include": "tasks"}, DOCUMENT)
+  clock.time += LIST_TTL - 1
+  assert cache.lookup("v1/progresses", {"activity_id": "a"}) == DOCUMENT
+  assert cache.lookup("v1/progresses", {"activity_id": "b"}) is None
+  clock.time += 2
+  assert cache.lookup("v1/progresses", {"activity_id": "a"}) is None
+  assert cache.lookup("v1/activities/a", {"include": "tasks"}) == DOCUMENT
+  clock.time += DETAIL_TTL
+  assert cache.lookup("v1/activities/a", {"include": "tasks"}) is None
+
+def test_a_validated_detail_needs_the_same_counts():
+  cache = Cache()
+  path = "https://api.example/v1/assignments/allocations/x/reviews"
+  cache.store(path, {}, DOCUMENT, validator=(2, 1))
+  assert cache.lookup(path, {}, validator=(2, 1)) == DOCUMENT
+  assert cache.lookup(path, {}, validator=(3, 1)) is None
+
+def test_uncached_paths_refresh_and_copies():
+  cache = Cache(refresh=True)
+  cache.store("v1/notifications", {}, DOCUMENT)
+  cache.store("v1/progresses", {}, DOCUMENT)
+  assert cache.lookup("v1/progresses", {}) is None
+  cache.refresh = False
+  assert "v1/notifications" not in "".join(cache.entries)
+  served = cache.lookup("v1/progresses", {})
+  served["data"].clear()
+  assert cache.lookup("v1/progresses", {}) == DOCUMENT
+@
+
+
+\section{The cache file}
+\label{CacheFile}
+
+The cache lives in one file per Canvas host, beside [[canvaslms]]'s own,
+and is encrypted the same way: with a key derived from the Canvas token
+and the host ([[derive_key]]).
+It holds what students wrote and who they are, so it must be as safe as
+[[canvaslms]]'s cache, which holds the same people; whoever has the token
+can fetch all of it anyway.
+A changed token makes the file unreadable, which we treat as an empty
+cache: it costs one slow run, not an error.
+The derivation takes a noticeable moment (PBKDF2, 100\,000 rounds), and we
+need the key twice per run, so we keep it.
+
+The content is JSON, not a pickle: the documents are JSON already, and a
+file that cannot run code when it is read is one thing less to trust.
+It records a schema version, and a file of another version is discarded.
+
+What is written is pruned first: entries whose time has run out, entries
+whose path no policy covers any more, and, when the user keeps personal
+data out of [[canvaslms]]'s cache ([[cache.exclude: personal]], read
+through [[excluded_kinds]]), every personal entry.
+Then the course content stays, which is what makes a run fast with or
+without the students' data.
+A [[canvaslms]] from before the exclusion existed (6.24, which we still
+accept) cannot exclude anything, so there everything may be written, as
+[[canvaslms]]'s own cache does there.
+The file is written to a temporary file and renamed, so that a run that
+dies while writing leaves the old file, not half a new one.
+
+<<imports>>=
+import functools
+import os
+import pathlib
+from cryptography.fernet import Fernet, InvalidToken
+import canvaslms
+import canvaslms.cli.cache
+<<constants>>=
+SCHEMA_VERSION = 1
+PERSONAL_KINDS = {"user", "submission"}
+<<cache methods>>=
+def snapshot(self, personal=True):
+    """Return the entries worth keeping, personal ones only if allowed."""
+    now = self.now()
+    with self.lock:
+        entries = dict(self.entries)
+    kept = {}
+    for key, entry in entries.items():
+        policy = policy_of(entry["path"])
+        if (policy is not None and now - entry["fetched"] <= policy.ttl
+                and (personal or not policy.personal)):
+            kept[key] = entry
+    return kept
+<<functions>>=
+def cache_file(hostname):
+    """Return the path of the cache file for a Canvas `hostname`."""
+    safe = re.sub(r"[^A-Za-z0-9.-]", "_", hostname)
+    return pathlib.Path(canvaslms.dirs.user_cache_dir) / f"fbf-{safe}.cache"
+
+
+@functools.lru_cache(maxsize=4)
+def fernet_for(token, hostname):
+    """Return the encryption of the cache file for `token` and `hostname`."""
+    return Fernet(canvaslms.cli.cache.derive_key(token, hostname))
+
+
+def personal_allowed():
+    """Whether personal data may go into the cache file."""
+    excluded = getattr(canvaslms.cli.cache, "excluded_kinds", frozenset)
+    return not PERSONAL_KINDS & set(excluded())
+
+
+def load_cache(hostname, token, refresh=False, now=time.time, path=None):
+    """Return the `Cache` stored for `hostname`, empty if there is none."""
+    path = pathlib.Path(path or cache_file(hostname))
+    try:
+        payload = json.loads(
+            fernet_for(token, hostname).decrypt(path.read_bytes()))
+    except (OSError, InvalidToken, ValueError):
+        payload = {}
+    if not isinstance(payload, dict) or \
+            payload.get("schema") != SCHEMA_VERSION:
+        payload = {}
+    return Cache(payload.get("entries"), payload.get("courses"), now=now,
+                 refresh=refresh)
+
+
+def save_cache(cache, hostname, token, path=None):
+    """Write `cache` to the file for `hostname`, encrypted and pruned."""
+    path = pathlib.Path(path or cache_file(hostname))
+    payload = {"schema": SCHEMA_VERSION, "courses": cache.courses,
+               "entries": cache.snapshot(personal_allowed())}
+    data = fernet_for(token, hostname).encrypt(json.dumps(payload).encode())
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(path.name + ".tmp")
+    temporary.write_bytes(data)
+    os.chmod(temporary, 0o600)
+    temporary.replace(path)
+@
+
+Let's verify the round trip and its refusals.
+The file must not show the data in plain text, a file read with another
+token or of another schema must give an empty cache, and expired entries
+must not be written.
+With personal data excluded, only the course content may be written.
+The key derivation is the real one; we only set [[excluded_kinds]], which
+is [[canvaslms]]'s configuration, not ours.
+
+<<test functions>>=
+def test_the_file_is_encrypted_and_survives_a_run(tmp_path):
+  clock, path = Clock(), tmp_path / "fbf.cache"
+  cache = Cache(courses={"5": "uuid-5"}, now=clock)
+  cache.store("v1/people/u1/emails", {},
+              {"data": [{"attributes": {"address": "ada@uni.example"}}]})
+  save_cache(cache, "canvas.example", "token", path)
+  assert b"ada@uni.example" not in path.read_bytes()
+  loaded = load_cache("canvas.example", "token", now=clock, path=path)
+  assert loaded.courses == {"5": "uuid-5"}
+  assert loaded.lookup("v1/people/u1/emails", {}) is not None
+  assert load_cache("canvas.example", "other token", path=path).entries == {}
+
+def test_expired_and_unknown_schemas_are_dropped(tmp_path):
+  clock, path = Clock(), tmp_path / "fbf.cache"
+  cache = Cache(now=clock)
+  cache.store("v1/progresses", {}, DOCUMENT)
+  clock.time += LIST_TTL + 1
+  save_cache(cache, "canvas.example", "token", path)
+  assert load_cache("canvas.example", "token", path=path).entries == {}
+  path.write_bytes(fernet_for("token", "canvas.example").encrypt(
+    json.dumps({"schema": SCHEMA_VERSION + 1,
+                "courses": {"5": "x"}}).encode()))
+  assert load_cache("canvas.example", "token", path=path).courses == {}
+
+def test_personal_data_stays_out_when_excluded(tmp_path, monkeypatch):
+  monkeypatch.setattr("canvaslms.cli.cache.excluded_kinds",
+                      lambda: frozenset({"user", "group", "submission"}),
+                      raising=False)
+  path = tmp_path / "fbf.cache"
+  cache = Cache()
+  cache.store("v1/people/u1/emails", {}, DOCUMENT)
+  cache.store("v1/activities/a", {"include": "tasks"}, DOCUMENT)
+  save_cache(cache, "canvas.example", "token", path)
+  loaded = load_cache("canvas.example", "token", path=path)
+  assert [json.loads(key)[0] for key in loaded.entries] == ["v1/activities/a"]
+@
+
+
+\section{The tokens}
+\label{CacheTokens}
+
+The launch is the one step we cannot cache as data: its result is a pair of
+tokens (\cref{Launch}).
+The access token is good for 30~minutes and the refresh token for 14~days,
+and one pair serves all the user's courses, so a run that finds a pair from
+an earlier run needs no launch at all, or one renewal (\cref{API}).
+Tokens are credentials, so they go where [[canvaslms]] keeps the Canvas
+token, in the system keyring, under the service [[fbf]] and the Canvas
+host, and never into the cache file.
+A system without a keyring simply launches every run, as before; that is
+no reason to warn every run.
+
+<<imports>>=
+import keyring
+import keyring.errors
+from fbf.launch import FBFLogin
+<<constants>>=
+KEYRING_SERVICE = "fbf"
+<<functions>>=
+def stored_login(hostname):
+    """Return the `FBFLogin` kept for `hostname`, or `None`."""
+    try:
+        text = keyring.get_password(KEYRING_SERVICE, hostname)
+    except keyring.errors.KeyringError:
+        return None
+    try:
+        data = json.loads(text or "")
+        return FBFLogin(access_token=data["access_token"],
+                        refresh_token=data["refresh_token"],
+                        api_url=data["api_url"])
+    except (ValueError, KeyError, TypeError):
+        return None
+
+
+def store_login(hostname, login):
+    """Keep the tokens of `login` for `hostname`, if there is a keyring."""
+    try:
+        keyring.set_password(KEYRING_SERVICE, hostname, json.dumps(
+            {"access_token": login.access_token,
+             "refresh_token": login.refresh_token,
+             "api_url": login.api_url}))
+    except keyring.errors.KeyringError:
+        pass
+@
+
+Let's verify the round trip with a keyring of our own in memory, which is
+the real [[keyring]] interface with a backend that keeps nothing beyond the
+test, and that a keyring that fails is no error.
+The viewer's tests need the same keyring (\cref{View}), so it is a shared
+fixture; no test may touch the user's real keyring.
+
+<<test fixtures>>=
+import keyring
+import keyring.backend
+
+
+class MemoryKeyring(keyring.backend.KeyringBackend):
+    """A keyring that keeps its passwords in memory, for one test."""
+
+    priority = 1
+
+    def __init__(self):
+        self.passwords = {}
+
+    def get_password(self, service, username):
+        return self.passwords.get((service, username))
+
+    def set_password(self, service, username, password):
+        self.passwords[(service, username)] = password
+
+    def delete_password(self, service, username):
+        self.passwords.pop((service, username), None)
+
+
+@pytest.fixture
+def memory_keyring():
+    """Put a keyring in memory in place of the user's for one test."""
+    before = keyring.get_keyring()
+    keyring.set_keyring(MemoryKeyring())
+    yield keyring.get_keyring()
+    keyring.set_keyring(before)
+<<test functions>>=
+import keyring
+from conftest import MemoryKeyring
+
+class BrokenKeyring(MemoryKeyring):
+  def get_password(self, service, username):
+    raise keyring.errors.KeyringError("locked")
+  def set_password(self, service, username, password):
+    raise keyring.errors.KeyringError("locked")
+
+def test_tokens_round_trip_through_the_keyring(memory_keyring):
+  assert stored_login("canvas.example") is None
+  store_login("canvas.example", FBFLogin("a", "r", "https://api.example"))
+  login = stored_login("canvas.example")
+  assert (login.access_token, login.refresh_token, login.api_url) \
+    == ("a", "r", "https://api.example")
+  keyring.set_keyring(BrokenKeyring())
+  store_login("canvas.example", login)
+  assert stored_login("canvas.example") is None
+@
