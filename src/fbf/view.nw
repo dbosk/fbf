@@ -100,16 +100,26 @@ The errors that [[canvaslms]] should report, rather than crash on, are
 those of a remote service that failed or changed: a launch that broke, a
 request that failed, a name FBF no longer has, a kind of data we cannot
 read.
-They are the errors that our own commands report as messages
-(\cref{CLI}), so we export the same tuple.
+They are nearly the errors that our own commands report as messages
+(\cref{CLI}), but not quite.
+A command reports any [[LookupError]] and [[OSError]], which in a view
+would also hide a [[KeyError]] of a bug or a file we failed to write, and
+show it as FBF's failure.
+So we take FBF's own lookup error, the unknown kind of data, and of the
+[[OSError]]s only those of [[requests]], which the downloads below raise.
 Any other exception is a bug, here or in the caller, and must stay loud.
 The [[Viewer]] below carries them too, as [[errors]], since a caller that
 found the class through the import system holds the viewer, not the module.
 
 <<imports>>=
-from fbf.cli import REPORTED_ERRORS
+import requests
+from fbf.api import APIError
+from fbf.launch import LaunchError
+from fbf.reviews import UnknownTypeError
+from fbf.schema import SchemaError
 <<constants>>=
-ERRORS = REPORTED_ERRORS
+ERRORS = (LaunchError, APIError, SchemaError, UnknownTypeError,
+          requests.RequestException)
 @
 
 
@@ -127,6 +137,13 @@ assignment that nobody has opened in this course round must not create its
 activity.
 That is why we list the course's assignments, from [[canvaslms]]'s cache,
 instead of using the one at hand.
+If that list holds no FBF assignment, as a stale cached list might, there
+is nothing safe to launch through, and the course has no activities for us.
+
+A launch that fails is remembered too, and raised again for the next
+submission of the course.
+When FBF is down, a view of a whole assignment would otherwise try the
+launch, and wait for its timeouts, once per student.
 
 An assignment whose code is not among the activities has no activity in
 this round, and we say so rather than show nothing, since nothing would
@@ -166,13 +183,27 @@ class Viewer:
     <<viewer methods>>
 <<viewer methods>>=
 def course(self, course_id):
-    """Return the FBF client of a Canvas course and its activities by code."""
+    """Return the FBF client of a Canvas course and its activities by code.
+
+    Raises the error of a failed launch, the same for every call.
+    """
     if course_id not in self.courses:
-        assignments = list(self.canvas.get_course(course_id).get_assignments())
-        fbf = self.connect(assignments)
-        self.courses[course_id] = (
-            fbf, fbfcanvas.activities_by_code(fbf, fbf.login.course_uuid))
-    return self.courses[course_id]
+        try:
+            self.courses[course_id] = self.launch(course_id)
+        except ERRORS as error:
+            self.courses[course_id] = error
+    found = self.courses[course_id]
+    if isinstance(found, Exception):
+        raise found
+    return found
+
+def launch(self, course_id):
+    """Launch FBF for a Canvas course; return the client and activities."""
+    assignments = list(self.canvas.get_course(course_id).get_assignments())
+    fbf = self.connect(assignments)
+    if fbf is None:
+        return None, {}
+    return fbf, fbfcanvas.activities_by_code(fbf, fbf.login.course_uuid)
 
 def activity(self, fbf, activity_id):
     """Return the `Activity` of `activity_id`, the same one every time."""
@@ -183,8 +214,8 @@ def activity(self, fbf, activity_id):
 
 An [[Activity]] holds what the parts read about one activity, each fetched
 the first time a part asks for it and then kept: the tasks, the
-participants' progresses, the participants themselves, the submissions and
-the discussion threads.
+participants' progresses, the participants themselves, the submissions,
+the review allocations, the reflections and the discussion threads.
 A part that is not shown, such as the reviews of a video activity, costs
 nothing.
 
@@ -230,6 +261,17 @@ class Activity:
                                          "submissions")).resources
 
     @functools.cached_property
+    def allocations(self):
+        """The allocations of the review task, all reviewers' and reviewees'."""
+        return review_module.task_allocations(self.fbf, self.task)
+
+    @functools.cached_property
+    def reflections(self):
+        """The reflections of all participants."""
+        return self.fbf.get(related_link(
+            self.task[review_module.REFLECT_TASK], "reflections")).resources
+
+    @functools.cached_property
     def threads(self):
         """The discussion threads on the activity's materials."""
         return discussion_module.activity_threads(self.fbf, self.id, "")
@@ -260,6 +302,11 @@ assignment asks each participant at most once.
 The result is a set of user ids, not one: a student can have two FBF
 identities with the same address, as the grade breakdown found
 (\cref{Progress}), and the work of both is the student's.
+The name costs us some of that: when a namesake matches, we do not ask the
+others, so a second identity under another name is missed.
+FBF takes the names from the LTI launch, that is from Canvas, so a second
+identity normally has the same name and is found; finding every identity
+for sure would cost a request per participant for every view.
 A student who matches no participant has not opened the activity.
 
 <<constants>>=
@@ -407,10 +454,11 @@ def media_base(api_url):
     return f"{parts.scheme}://{host}"
 
 
-def download_media(session, base, media_id, workdir):
+def download_media(session, base, media_id, workdir, taken=None):
     """Download the file of `media_id` into `workdir`; return its path.
 
-    Returns `None` when the media service has no file for it.
+    Returns `None` when the media service has no file for it.  `taken` are
+    the file names already used by this view, which a new name avoids.
     """
     url = f"{base}/{media_id}"
     info = checked(session.get(url, timeout=TIMEOUT), url).json()
@@ -421,7 +469,9 @@ def download_media(session, base, media_id, workdir):
     response = checked(session.get(url, timeout=TIMEOUT), url)
     workdir = pathlib.Path(workdir)
     workdir.mkdir(parents=True, exist_ok=True)
-    path = free_path(workdir, f"{pathlib.PurePath(name).name or 'file'}.{kind}")
+    path = workdir / free_name(
+        f"{pathlib.PurePath(name).name or 'file'}.{kind}",
+        set() if taken is None else taken)
     path.write_bytes(response.content)
     return path
 @
@@ -449,17 +499,21 @@ def checked(response, url):
 Two items may have the same name, two versions of [[lab.py]] say, and the
 second must not overwrite the first, so we number the later ones the way
 browsers number downloads.
+We number against the names of this one view, [[taken]], not against the
+files in the directory: a second view into the same directory, as with
+[[canvaslms]]'s [[-o]], must overwrite the files of the first rather than
+add [[lab (2).py]] beside them.
 
 <<functions>>=
-def free_path(directory, filename):
-    """Return `directory/filename`, numbered if that is taken."""
-    path = directory / filename
-    stem, suffix = path.stem, path.suffix
-    number = 1
-    while path.exists():
+def free_name(filename, taken):
+    """Return `filename`, numbered if in `taken`; add the result to `taken`."""
+    path = pathlib.PurePath(filename)
+    name, number = filename, 1
+    while name in taken:
         number += 1
-        path = directory / f"{stem} ({number}){suffix}"
-    return path
+        name = f"{path.stem} ({number}){path.suffix}"
+    taken.add(name)
+    return name
 @
 
 To test the downloads we run a real web server on the local host (rung~2
@@ -509,20 +563,26 @@ def media_server():
   server.server_close()
 @
 
-A file arrives under its own name, a second copy is numbered, a media
-without a type gives no file, and an unknown one fails with the URL we
-asked for, not the storage URL.
+A file arrives under its own name, a second copy in the same view is
+numbered, a new view overwrites, a media without a type gives no file, and
+an unknown one fails with the URL we asked for, not the storage URL.
 
 <<test functions>>=
 import requests
 
 def test_download_media_follows_the_redirect_and_numbers_copies(
     media_server, tmp_path):
-  session = requests.Session()
-  first = download_media(session, media_server, "m1", tmp_path / "work")
-  second = download_media(session, media_server, "m1", tmp_path / "work")
+  session, taken = requests.Session(), set()
+  first = download_media(session, media_server, "m1", tmp_path / "work",
+                         taken)
+  second = download_media(session, media_server, "m1", tmp_path / "work",
+                          taken)
   assert first.name == "lab.py" and second.name == "lab (2).py"
   assert second.read_text() == "print('hello')\n"
+  again = download_media(session, media_server, "m1", tmp_path / "work")
+  assert again == first
+  assert sorted(p.name for p in (tmp_path / "work").iterdir()) \
+    == ["lab (2).py", "lab.py"]
   assert download_media(session, media_server, "m2", tmp_path) is None
   with pytest.raises(APIError) as error:
     download_media(session, media_server, "m3", tmp_path)
@@ -548,11 +608,11 @@ def work_section(activity, users, workdir):
     if not items:
         return Section(WORK_TITLE, "Nothing handed in.")
     base = media_base(activity.fbf.login.api_url)
-    lines, files = [], []
+    lines, files, taken = [], [], set()
     for item in items:
         media = related_id(item, "media")
         path = media and download_media(activity.fbf.session, base, media,
-                                        workdir)
+                                        workdir, taken)
         line = (f"- {attribute(item, 'title')} "
                 f"({attribute(item, 'category')}, "
                 f"{attribute(item, 'created-at')})")
@@ -628,6 +688,8 @@ Both come from the allocations of the review task, the student being the
 The fetchers of \cref{Reviews} take a test of the allocations to keep, so
 we pass one for each and pay only for the student's allocations, a handful
 of requests instead of hundreds.
+The list of allocations itself they take from the [[Activity]], which
+fetches it once for all students.
 With the reviews come the ratings of them: those the student gave the
 reviews received, and those the reviewees gave the student's reviews.
 
@@ -643,10 +705,12 @@ def review_sections(activity, users):
     for title, role, other in [(RECEIVED_TITLE, "allocable", "reviewer"),
                                (GIVEN_TITLE, "actor", "reviewee")]:
         keep = in_role(users, role)
-        reviews = review_module.fetch_reviews(activity.fbf, activity.task,
-                                              "", keep=keep)
-        feedbacks = review_module.fetch_feedback(activity.fbf, activity.task,
-                                                 "", keep=keep)
+        reviews = review_module.fetch_reviews(
+            activity.fbf, activity.task, "", keep=keep,
+            allocations=activity.allocations)
+        feedbacks = review_module.fetch_feedback(
+            activity.fbf, activity.task, "", keep=keep,
+            allocations=activity.allocations)
         sections.append(Section(title, reviews_text(reviews, feedbacks,
                                                     other)))
     return sections
@@ -726,7 +790,7 @@ def test_review_sections_ask_only_for_the_students_allocations():
 \label{ViewReflection}
 
 The reflections are one list behind the reflect task, by all students
-(\cref{Reviews}).
+(\cref{Reviews}), which the [[Activity]] fetches once.
 We keep the student's, by user id, and turn their Quill bodies into text
 with the reviews chapter's [[plain_text]].
 
@@ -735,9 +799,7 @@ REFLECTION_TITLE = "Reflection"
 <<functions>>=
 def reflection_section(activity, users):
     """Return the `Section` of the reflection of `users`."""
-    task = activity.task[review_module.REFLECT_TASK]
-    reflections = [reflection for reflection in activity.fbf.get(
-                       related_link(task, "reflections")).resources
+    reflections = [reflection for reflection in activity.reflections
                    if related_id(reflection, "user") in users]
     texts = [review_module.plain_text(attribute(r, "body")).strip()
              for r in reflections]
@@ -895,15 +957,21 @@ def test_each_part_puts_an_error_in_the_parts_place():
     ("A", "a"), ("B", FAILED.format("GET /v1/x: HTTP 500"))]
   with pytest.raises(TypeError):
     each_part([("C", True, buggy)])
+  with pytest.raises(KeyError):
+    each_part([("D", True, lambda: {}["typo"])])
 @
 
 Now the whole, offline.
 A course has two FBF assignments; the one we view has an activity, a peer
-review where Ada handed in one file, and the other was never opened.
-Ada is user [[u2]], as in \cref{fake-fbf}, and her file comes from the
-local media server.
-The view must give every part, launch once for both assignments, and say
-of the unopened one that it has no activity.
+review, and the other was never opened.
+Ada is user [[u2]], as in \cref{fake-fbf}.
+She handed in twice: a file that comes from the local media server, and
+before it one that FBF has no file for; she has two progresses, of which
+the one with the higher grade explains it.
+Bo ([[u1]]) took part too, and a teacher ([[u9]]); Cy is a Canvas student
+who never opened the activity, and Di is no student at all.
+The view of Ada must give every part, the items oldest first, and launch
+once for both assignments; the unopened one has no activity.
 
 <<test functions>>=
 from fbf.reviews import REVIEW_TASK, VIEW_TASK, REFLECT_TASK
@@ -921,10 +989,10 @@ def progress(id, actor, overall):
                             "progressable": ref("activities", "act"),
                             "latest-grade": {"data": None}}}
 
-def handed_in(id, user, media):
+def handed_in(id, user, media, created):
   return {"type": "assignments/submission", "id": id,
           "attributes": {"title": "lab", "category": "document",
-                         "created-at": "2026-10-01T10:00Z"},
+                         "created-at": created},
           "relationships": {"user": ref("users", user),
                             "media": ref("media", media)}}
 
@@ -937,24 +1005,32 @@ def world(media_server):
       "tasks": {"data": [{"type": t["type"], "id": t["id"]}
                          for t in tasks]}}},
     "included": tasks}
-  fbf.documents["v1/progresses"] = {"data": [progress("p1", "u1", 50.0),
-                                             progress("p2", "u2", 80.0)]}
-  fbf.documents["/t5/submissions"] = {"data": [handed_in("s1", "u2", "m1"),
-                                               handed_in("s2", "u1", "m9")]}
-  fbf.documents["v1/people/u2/emails"] = emails_document("ada@uni.example")
+  fbf.documents["v1/progresses"] = {"data": [
+    progress("p1", "u1", 50.0), progress("p2", "u2", 80.0),
+    progress("p3", "u2", 10.0), progress("p9", "u9", 0.0)]}
+  fbf.documents["/t5/submissions"] = {"data": [
+    handed_in("s1", "u2", "m1", "2026-10-01T10:00Z"),
+    handed_in("s2", "u1", "m9", "2026-10-01T09:00Z"),
+    handed_in("s3", "u2", "m2", "2026-09-30T10:00Z")]}
+  for id, address in [("u1", "bo@uni.example"), ("u2", "ada@uni.example"),
+                      ("u9", "teacher@uni.example")]:
+    fbf.documents[f"v1/people/{id}/emails"] = emails_document(address)
   fbf.documents["v1/courses/c/activities"] = {
     "data": [{"type": "activities", "id": "act",
               "relationships": {"placement": ref("lti/placement", "pl")}}],
     "included": [{"type": "lti/placement", "id": "pl",
                   "attributes": {"code": "opened"}}]}
   fbf.by_id["v1/lti/grades"] = {}
+  fbf.by_id["v1/users"] = {**USERS, "u9": user("u9", "Teacher")}
   fbf.login = SimpleNamespace(api_url=media_server, course_uuid="c")
   fbf.session = requests.Session()
   return fbf
 @
 
 The Canvas side is canvasapi's own classes on a fake course, as in
-\cref{Progress}: two FBF assignments, and Ada among the students.
+\cref{Progress}: two FBF assignments, and the students Ada, Bo and Cy.
+The fake client also records the ids of each request by id, so that we can
+tell the participants' request from the reviews' requests for users.
 
 <<test functions>>=
 from canvasapi.assignment import Assignment as CanvasAssignment
@@ -974,30 +1050,106 @@ class Course:
   def get_users(self, **params):
     return self.users
 
-def ada():
-  return User(None, {"id": 2, "name": "Ada", "login_id": "ada",
-                     "email": "ada@uni.example",
+def canvas_student(id, name, email):
+  return User(None, {"id": id, "name": name, "login_id": name.lower(),
+                     "email": email,
                      "enrollments": [{"type": "StudentEnrollment"}]})
+
+STUDENTS = [canvas_student(2, "Ada", "ada@uni.example"),
+            canvas_student(1, "Bo", "bo@uni.example"),
+            canvas_student(3, "Cy Student", "cy@uni.example")]
+
+class LoggingFBF(FakeFBF):
+  """The fake client, also logging the ids of each request by id."""
+  def get_by_ids(self, path, ids):
+    self.asked_ids = getattr(self, "asked_ids", []) + [(path, set(ids))]
+    return super().get_by_ids(path, ids)
+
+def viewer_of(fbf, launches=None):
+  opened, unopened = fbf_assignment(1, "opened"), fbf_assignment(2, "new")
+  course = Course([opened, unopened], STUDENTS)
+  def connect(assignments):
+    if launches is not None:
+      launches.append(1)
+    return fbf
+  viewer = Viewer(SimpleNamespace(get_course=lambda id: course), None, None,
+                  connect=connect)
+  return viewer, opened, unopened
+
+def view(viewer, assignment, user_id, workdir, score=None):
+  return viewer.sections(SimpleNamespace(assignment=assignment,
+                                         user_id=user_id, score=score),
+                         workdir)
 
 def test_viewer_gives_every_part_and_launches_once(media_server, tmp_path):
   fbf = world(media_server)
-  opened, unopened = fbf_assignment(1, "opened"), fbf_assignment(2, "new")
-  course = Course([opened, unopened], [ada()])
   launches = []
-  viewer = Viewer(SimpleNamespace(get_course=lambda id: course), None, None,
-                  connect=lambda assignments: launches.append(1) or fbf)
-  sections = viewer.sections(
-    SimpleNamespace(assignment=opened, user_id=2, score=8.0), tmp_path)
+  viewer, opened, unopened = viewer_of(fbf, launches)
+  sections = view(viewer, opened, 2, tmp_path, score=8.0)
   assert [s.title for s in sections] == [
     WORK_TITLE, GRADE_TITLE, RECEIVED_TITLE, GIVEN_TITLE, REFLECTION_TITLE]
-  work = sections[0]
+  work, grade = sections[0], sections[1]
   assert [f.name for f in work.files] == ["lab.py"]
-  assert work.body == "- lab (document, 2026-10-01T10:00Z)"
-  assert "- Overall: 80 %, 8 of 10 points" in sections[1].body
-  assert viewer.sections(SimpleNamespace(assignment=unopened, user_id=2,
-                                         score=None), tmp_path) \
+  assert work.body.splitlines() == [
+    f"- lab (document, 2026-09-30T10:00Z): {NO_FILE}",
+    "- lab (document, 2026-10-01T10:00Z)"]
+  assert "- Overall: 80 %, 8 of 10 points" in grade.body
+  assert "- In Canvas: 8 points" in grade.body
+  assert view(viewer, unopened, 2, tmp_path) \
     == [Section(WORK_TITLE, NOT_OPENED)]
   assert launches == [1]
+@
+
+Viewing more students reuses what the first view fetched: the participants,
+their addresses, the allocations and the progresses are asked for once,
+whoever is viewed.
+Cy, whom the namesakes do not find, makes us ask the rest of the
+participants for their addresses, and still matches none of them; Di, who
+is no student, is not looked for at all.
+
+<<test functions>>=
+def test_viewer_asks_once_for_what_all_students_share(media_server,
+                                                      tmp_path):
+  fbf = world(media_server)
+  fbf.__class__ = LoggingFBF
+  viewer, opened, _ = viewer_of(fbf)
+  view(viewer, opened, 2, tmp_path)
+  assert [s.title for s in view(viewer, opened, 1, tmp_path)][:2] \
+    == [WORK_TITLE, GRADE_TITLE]
+  assert view(viewer, opened, 3, tmp_path) \
+    == [Section(WORK_TITLE, NOT_TAKEN_PART)]
+  assert view(viewer, opened, 4, tmp_path) \
+    == [Section(WORK_TITLE, NOT_A_STUDENT)]
+  for path in ["v1/people/u1/emails", "v1/people/u2/emails",
+               "v1/people/u9/emails", "/t1/allocations", "v1/progresses",
+               "/t3/reflections", "/t5/submissions"]:
+    assert fbf.asked.count(path) == 1, path
+  assert fbf.asked_ids.count(("v1/users", {"u1", "u2", "u9"})) == 1
+@
+
+A launch that fails is not tried again for the next student of the course,
+and a course whose listing has no FBF assignment has no activity.
+
+<<test functions>>=
+def test_viewer_remembers_a_failed_launch(tmp_path):
+  launches = []
+  def connect(assignments):
+    launches.append(1)
+    raise LaunchError(0, "launch", "refused")
+  course = Course([fbf_assignment(1, "opened")], STUDENTS)
+  viewer = Viewer(SimpleNamespace(get_course=lambda id: course), None, None,
+                  connect=connect)
+  for _ in range(2):
+    with pytest.raises(LaunchError):
+      view(viewer, course.assignments[0], 2, tmp_path)
+  assert launches == [1]
+
+def test_viewer_without_an_fbf_assignment_to_launch_through(tmp_path):
+  course = Course([fbf_assignment(1, "opened")], STUDENTS)
+  viewer = Viewer(SimpleNamespace(get_course=lambda id: course), None, None,
+                  connect=lambda assignments: None)
+  assert view(viewer, course.assignments[0], 2, tmp_path) \
+    == [Section(WORK_TITLE, NOT_OPENED)]
 @
 
 A Canvas assignment that is not FBF's must cost nothing at all: no launch,
