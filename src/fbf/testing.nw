@@ -942,6 +942,13 @@ On top of that come FBF's own fields:
 \end{description}
 Titles we keep: the [[title]] of an activity is course content, it names the
 assignment rather than a person, and the tests may want to read it.
+The exception is work that a student handed in, an [[assignments/submission]]
+(\cref{ViewWork}): its title is the name the student gave the file, which may
+hold the student's name or username.
+The first recording of it held a username inside such a title, which the scan
+reported.
+So for the types in [[FBF_STUDENT_TITLED_TYPES]] the title is replaced as
+free text.
 <<scrubbing for FBF>>=
 def kebab(keys):
     """Return `keys` together with their kebab-case spellings."""
@@ -955,6 +962,15 @@ FBF_URL_IDENTITY_KEYS = kebab(vcr_support.URL_IDENTITY_KEYS)
 FBF_FREE_TEXT_KEYS = kebab(vcr_support.FREE_TEXT_KEYS) | {
     "body-rendered", "solution", "solution-rendered",
     "description-rendered"}
+FBF_STUDENT_TITLED_TYPES = {"assignments/submission"}
+
+
+def student_titled(obj):
+    """True if `obj` is a resource whose title a student chose."""
+    kind = obj.get("type")
+    return (isinstance(kind, str) and kind in FBF_STUDENT_TITLED_TYPES
+            and isinstance(obj.get("attributes"), dict)
+            and "title" in obj["attributes"])
 @
 
 \subsubsection{People in JSON:API}
@@ -1020,6 +1036,10 @@ the tests below check the result, not the mechanism: if a new copy of
 def _collect(self, obj, parent=None):
     if isinstance(obj, dict):
         obj = {key: redact_secret(key, value) for key, value in obj.items()}
+        if student_titled(obj):
+            obj = {**obj, "attributes": {
+                **obj["attributes"],
+                "title": self._replace_text(obj["attributes"]["title"])}}
         if parent != "relationships":
             obj = {key: self._free_text(key, value)
                    for key, value in obj.items()}
@@ -1036,7 +1056,8 @@ The tests use a pseudonymizer of their own, not the one of the run, which
 would note the made-up values as originals while recording and then look for
 them in the real cassettes.
 None of the personal values may survive, the secrets must become the
-placeholder, and the title must stay as it is.
+placeholder, the title of the work handed in must go, and the title of the
+activity must stay as it is.
 The user has only attributes that FBF's users have.
 An [[avatar-url]] among them would by itself make the attributes look like a
 person's, and the test would pass with the rule for [[users]] broken, so the
@@ -1065,6 +1086,8 @@ FBF_DOCUMENT = {
      "attributes": {"solution": "Fortytwo",
                     "solution-rendered": "<p>Fortytwo</p>",
                     "description-rendered": "<p>Do it</p>"}},
+    {"type": "assignments/submission", "id": "s1",
+     "attributes": {"title": "anna-andersson-lab1", "category": "document"}},
     {"type": "activities", "id": "a1",
      "attributes": {"title": "Peer review 1", "name": "Peer review 1"}},
   ],
@@ -1074,7 +1097,7 @@ def test_recordings_replace_fbfs_own_fields(scrubber):
   scrubbed = scrubber.scrub_json(json.loads(json.dumps(FBF_DOCUMENT)))
   text = json.dumps(scrubbed)
   for value in ("Anna", "Andersson", "anna@uni.example.se", "0a1b2c3d4e5f",
-                "anna.png", "Bo Berg", "<p>", "Fortytwo"):
+                "anna.png", "Bo Berg", "<p>", "Fortytwo", "anna-andersson"):
     assert value not in text, value
   user = scrubbed["data"]["attributes"]
   assert user["zendesk-hash"] == "redacted"
@@ -1233,8 +1256,13 @@ def _free_text(self, key, value):
     """Return the placeholder for the free text `value` under `key`, noting
     the text if it is worth looking for."""
     name = str(key).lower()
-    if (name not in self.free_text_keys or name in self.keep_text
-            or not value or isinstance(value, (int, float, bool))
+    if name not in self.free_text_keys or name in self.keep_text:
+        return value
+    return self._replace_text(value)
+
+def _replace_text(self, value):
+    """Return the placeholder for the free text `value`, noting it."""
+    if (not value or isinstance(value, (int, float, bool))
             or (isinstance(value, str) and is_ours(value))):
         return value
     self._log(*[text for text in strings_in(value) if identifying(text)])
