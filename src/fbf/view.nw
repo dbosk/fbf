@@ -103,6 +103,8 @@ read.
 They are the errors that our own commands report as messages
 (\cref{CLI}), so we export the same tuple.
 Any other exception is a bug, here or in the caller, and must stay loud.
+The [[Viewer]] below carries them too, as [[errors]], since a caller that
+found the class through the import system holds the viewer, not the module.
 
 <<imports>>=
 from fbf.cli import REPORTED_ERRORS
@@ -146,8 +148,11 @@ class Viewer:
     `canvas` is a `canvasapi.Canvas`; `canvas_url` and `canvas_token` are
     what the launch needs (see `fbf.launch.launch`).  A viewer keeps what
     is the same for many submissions: one launch per course, and per
-    activity its tasks, participants and their email addresses.
+    activity its tasks, participants and their email addresses.  `errors`
+    are the exceptions that mean FBF failed or changed, to be reported.
     """
+
+    errors = ERRORS
 
     def __init__(self, canvas, canvas_url, canvas_token, connect=None):
         self.canvas = canvas
