@@ -683,19 +683,22 @@ cost is in the lists behind the allocations: an allocation left out is a
 request not sent.
 FBF cannot do the filtering for us, since it has no filter for the
 allocations of one user, and an unknown filter is silently ignored.
+Such a caller also asks again for each student, so it may pass the
+activity's [[allocations]] that it fetched once, and the fetchers do not
+ask for them again.
 
 <<functions>>=
-def fetch_reviews(fbf, tasks, activity, keep=None):
+def fetch_reviews(fbf, tasks, activity, keep=None, allocations=None):
     """Return the `Review`s of a peer-review activity with `tasks`.
 
     `activity` labels the reviews.  `keep`, if given, is a test of the
-    allocations to include; the others cost no request.
+    allocations to include; the others cost no request.  `allocations`, if
+    given, are the review task's allocations, fetched before.
     """
     task = tasks[REVIEW_TASK]
     criteria = fbf.get(related_link(task, "criteria")).resources
     check_criteria(criteria)
-    allocations = kept(fbf.get(related_link(task, "allocations")).resources,
-                       keep)
+    allocations = kept(task_allocations(fbf, tasks, allocations), keep)
     users = allocation_users(fbf, allocations)
     lists = allocation_lists(fbf, allocations,
                              {"reviews": counted("reviews-count"),
@@ -715,6 +718,13 @@ def allocation_users(fbf, allocations):
                           [person(allocation, name)
                            for allocation in allocations
                            for name in ("actor", "allocable")])
+
+
+def task_allocations(fbf, tasks, allocations=None):
+    """Return the review task's allocations: `allocations`, or fetched."""
+    if allocations is not None:
+        return allocations
+    return fbf.get(related_link(tasks[REVIEW_TASK], "allocations")).resources
 
 
 def kept(allocations, keep=None):
@@ -799,15 +809,15 @@ def reviewed(allocation):
                 or attribute(allocation, "ratings-count"))
 
 
-def fetch_feedback(fbf, tasks, activity, keep=None):
+def fetch_feedback(fbf, tasks, activity, keep=None, allocations=None):
     """Return the `Feedback` on the reviews of a peer-review activity.
 
-    `keep`, if given, is a test of the allocations to include.
+    `keep`, if given, is a test of the allocations to include;
+    `allocations`, if given, the review task's allocations fetched before.
     """
     if not feedback_enabled(tasks):
         return []
-    allocations = kept(fbf.get(related_link(tasks[REVIEW_TASK],
-                                            "allocations")).resources, keep)
+    allocations = kept(task_allocations(fbf, tasks, allocations), keep)
     users = allocation_users(fbf, allocations)
     lists = allocation_lists(fbf, allocations,
                              {"reviewer-feedback": reviewed})
