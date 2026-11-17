@@ -216,6 +216,7 @@ class FBF:
         self.relaunch = relaunch
         self.session = session or requests.Session()
         self.renewal = threading.Lock()
+        self.slots = threading.BoundedSemaphore(WORKERS)
         self.cache = cache
 
     <<FBF methods>>
@@ -308,7 +309,9 @@ def _send(self, method, url, token, **kwargs):
     headers.update(kwargs.pop("headers", {}))
     kwargs.setdefault("timeout", TIMEOUT)
     try:
-        return self.session.request(method, url, headers=headers, **kwargs)
+        with self.slots:
+            return self.session.request(method, url, headers=headers,
+                                        **kwargs)
     except requests.exceptions.Timeout:
         raise APIError("timeout", method, url)
 @
@@ -472,6 +475,13 @@ waiting for FBF.
 [[get_many]] sends such requests from a few threads at once.
 We keep the number of threads small: FBF is a shared service, and a handful
 of parallel requests is what its own web app makes when it loads a page.
+The limit holds for the client, not for each call: callers may themselves
+run in threads, as the parts of a view do (\cref{ViewTogether}), each with
+a [[get_many]] of its own, and six requests from each would be thirty at
+once, more than FBF's web app sends and more than the session's ten
+connections.
+So every request takes one of [[WORKERS]] slots of the client while it is
+under way, however many threads want one.
 The results come back in the order of the requests, so callers can zip them
 with what they asked for.
 
@@ -564,8 +574,8 @@ def get_by_ids(self, path, ids):
     the result.  With a cache, only the ids not cached are asked for.
     """
     ids = sorted(set(ids) - {None})
-    found = {id: Document(cached).resource for id in ids
-             for cached in [self.cached_id(path, id)] if cached}
+    found = {id: resource for id in ids
+             for resource in [self.cached_id(path, id)] if resource}
     missing = [id for id in ids if id not in found]
     batches = [missing[start:start + ID_BATCH]
                for start in range(0, len(missing), ID_BATCH)]
@@ -577,15 +587,16 @@ def get_by_ids(self, path, ids):
             if resource["id"] in wanted:
                 found[resource["id"]] = resource
                 if self.cache is not None:
-                    self.cache.store(path, {"filter[id]": resource["id"]},
-                                     {"data": [resource]})
+                    self.cache.store_resource(path, resource)
     return found
 
 def cached_id(self, path, id):
-    """Return the cached document of the one resource `id`, or `None`."""
+    """Return the cached resource `id` from the list `path`, or `None`."""
     if self.cache is None:
         return None
-    return self.cache.lookup(path, {"filter[id]": id})
+    document = self.cache.lookup(path, {"filter[id]": id})
+    resource = Document(document).resource if document else None
+    return resource if resource and resource.get("id") == id else None
 @
 
 With a cache, [[get_by_ids]] keeps each resource on its own, as the
@@ -649,6 +660,86 @@ def test_the_client_asks_the_cache_first():
   fbf.get_by_ids("v1/users", ["u2", "u3"])
   assert [ids for path, ids in session.asked if path == "v1/users"] \
     == ["u1,u2", "u3"]
+@
+
+A batch of one id is a request by ids too: an answer without the id, or
+with another resource than the one asked for, must not be served as that
+id the next time.
+
+<<test functions>>=
+class StrangerSession(LoggingSession):
+  def request(self, method, url, headers=None, params=None, **kwargs):
+    self.asked.append(url)
+    return SimpleNamespace(status_code=200, ok=True, json=lambda: {
+      "data": [{"type": "users", "id": "stranger"}]})
+
+def test_an_answer_without_the_id_is_not_kept_as_it():
+  session = StrangerSession()
+  login = SimpleNamespace(access_token="t", refresh_token=None,
+                          api_url="https://api.example.com")
+  fbf = FBF(login, session=session, cache=Cache())
+  assert fbf.get_by_ids("v1/users", ["u9"]) == {}
+  assert fbf.get_by_ids("v1/users", ["u9"]) == {}
+  assert len(session.asked) == 2
+@
+
+A document of several pages is kept under the request as the caller made
+it, not under the last page's: the next [[get]] of the same request must
+find it.
+
+<<test functions>>=
+class PagedSession(LoggingSession):
+  def request(self, method, url, headers=None, params=None, **kwargs):
+    self.asked.append(dict(params or {}))
+    page = int((params or {}).get("page[number]", 1))
+    meta = {"page": page, "total-pages": 2}
+    return SimpleNamespace(status_code=200, ok=True, json=lambda: {
+      "data": [{"type": "x", "id": str(page)}], "meta": meta})
+
+def test_a_paged_document_is_kept_under_the_first_request():
+  session = PagedSession()
+  login = SimpleNamespace(access_token="t", refresh_token=None,
+                          api_url="https://api.example.com")
+  fbf = FBF(login, session=session, cache=Cache())
+  first = fbf.get("v1/progresses", activity_id="a")
+  again = fbf.get("v1/progresses", activity_id="a")
+  assert [r["id"] for r in again.resources] \
+    == [r["id"] for r in first.resources]
+  assert len(session.asked) == len(first.resources)
+@
+
+However many threads use the client, no more than [[WORKERS]] requests
+are under way at once.
+Three threads each fetch six documents with [[get_many]], from a session
+that counts the requests in flight and holds each a moment.
+
+<<test functions>>=
+class CountingSession:
+  def __init__(self):
+    self.lock, self.now, self.most = _threading.Lock(), 0, 0
+  def request(self, method, url, headers=None, **kwargs):
+    with self.lock:
+      self.now += 1
+      self.most = max(self.most, self.now)
+    time.sleep(0.05)
+    with self.lock:
+      self.now -= 1
+    return SimpleNamespace(status_code=200, ok=True,
+                           json=lambda: {"data": {"type": "x", "id": "1"}})
+
+def test_the_client_limits_the_requests_in_flight():
+  session = CountingSession()
+  login = SimpleNamespace(access_token="t", refresh_token=None,
+                          api_url="https://api.example.com")
+  fbf = FBF(login, session=session)
+  threads = [_threading.Thread(target=fbf.get_many,
+                               args=([(f"v1/x/{n}", {}) for n in range(6)],))
+             for _ in range(3)]
+  for thread in threads:
+    thread.start()
+  for thread in threads:
+    thread.join()
+  assert session.most == WORKERS
 @
 
 
