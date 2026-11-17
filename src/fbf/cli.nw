@@ -64,14 +64,81 @@ REPORTED_ERRORS = (LaunchError, APIError, SchemaError, LookupError,
                    OSError)
 <<functions>>=
 def reporting_errors(command):
-    """Wrap `command` to exit with the message of our errors."""
+    """Wrap `command` to exit with the message of our errors.
+
+    A command given a Canvas object also gets the FBF cache of its Canvas
+    host as `args.fbf_cache`, which is saved when it is done.
+    """
     @functools.wraps(command)
     def wrapper(config, canvas, args):
-        try:
-            return command(config, canvas, args)
-        except REPORTED_ERRORS as error:
-            canvaslms.cli.err(1, str(error))
+        with fbf_cache(config, canvas, args):
+            try:
+                return command(config, canvas, args)
+            except REPORTED_ERRORS as error:
+                canvaslms.cli.err(1, str(error))
     return wrapper
+@
+
+The same wrapper gives every command that talks to FBF the cache between
+runs (\cref{Cache}): it reads the cache file of the Canvas host before the
+command and writes it afterwards, also when the command fails, so that
+what was fetched before the failure is not fetched again.
+[[--refresh-cache]], a global option of [[canvaslms]], makes the cache
+serve nothing; the standalone [[fbf]] has no such option, so the attribute
+may be missing.
+A command that needs no Canvas object, such as [[har-shape]], gets no
+cache.
+
+<<imports>>=
+import contextlib
+import canvaslms.cli.cache
+import canvaslms.cli.login
+from fbf import cache as cache_module
+<<functions>>=
+@contextlib.contextmanager
+def fbf_cache(config, canvas, args):
+    """Give `args` the FBF cache while a command runs, then save it."""
+    if canvas is None:
+        yield None
+        return
+    hostname, token = canvaslms.cli.login.load_credentials(config)
+    url = canvaslms.cli.cache.normalize_hostname(hostname)
+    args.fbf_cache = cache_module.load_cache(
+        url, token, refresh=getattr(args, "refresh_cache", False))
+    try:
+        yield args.fbf_cache
+    finally:
+        cache_module.save_cache(args.fbf_cache, url, token)
+@
+
+Let's verify that a command finds a cache, that what it stored is in the
+file afterwards even when it fails, and that a command without Canvas gets
+none.
+The credentials are [[canvaslms]]'s, which we replace, and the file goes to
+a temporary directory, never to the user's.
+
+<<test [[cli.py]]>>=
+import types
+import pytest
+import fbf.cache
+from fbf.api import APIError
+
+def test_commands_get_the_cache_and_it_is_saved(tmp_path, monkeypatch):
+  monkeypatch.setattr("canvaslms.cli.login.load_credentials",
+                      lambda config: ("canvas.example", "token"))
+  monkeypatch.setattr("fbf.cache.cache_file",
+                      lambda hostname: tmp_path / "fbf.cache")
+  def command(config, canvas, args):
+    args.fbf_cache.courses["5"] = "uuid-5"
+    raise APIError(500, "GET", "https://api.example/v1/x")
+  args = types.SimpleNamespace()
+  with pytest.raises(SystemExit):
+    fbf.cli.reporting_errors(command)({}, object(), args)
+  assert fbf.cache.load_cache("https://canvas.example", "token").courses \
+    == {"5": "uuid-5"}
+  def local(config, canvas, args):
+    assert not hasattr(args, "fbf_cache")
+  fbf.cli.reporting_errors(local)({}, None, types.SimpleNamespace())
 @
 
 
