@@ -494,6 +494,13 @@ together.
 Unlike the progresses, a student's allocations can change as a whole: a
 teacher may reallocate the reviews, so we remember them for a day only
 (\cref{Cache}), after which the next view reads the list again.
+Within that day an allocation added since is not shown, which is the price
+of not reading the list; [[--refresh-cache]] shows it at once.
+An allocation removed since cannot be fetched by its id, and then the
+remembered ids are forgotten and the list is read, so a removal costs a
+slower view, not a broken one.
+A student without allocations is not remembered as such, since an empty
+set would hide allocations made later; such a student costs the list.
 The progresses taken from the list are also kept as the answers to those
 requests by id, so a view within five minutes asks for nothing.
 What it may miss is a second identity created in FBF since, until the
@@ -505,7 +512,11 @@ PROGRESS_PATH = "fbf/progress-ids/{activity}/{user}"
 ALLOCATION_PATH = "fbf/allocation-ids/{activity}/{user}"
 <<viewer methods>>=
 def users_of(self, activity, course_id, student):
-    """Return the ids of the FBF users who are `student`, remembered."""
+    """Return the ids of the FBF users who are `student`, remembered.
+
+    It starts the prefetch of the activity's lists, leaving out those
+    that what is remembered about `student` makes unnecessary.
+    """
     path = STUDENT_PATH.format(course=course_id, user=student.id)
     known = self.remembered(path)
     allocations = self.remembered(
@@ -536,12 +547,19 @@ def progresses_of(self, activity, users, student):
     return mine
 
 def allocations_of(self, activity, users, student):
-    """Return the allocations of `users` in `activity`, by remembered ids."""
+    """Return the allocations of `student`, who is `users`, in `activity`.
+
+    By the ids remembered for `student` if there are any and they can all
+    be fetched; else from the activity's list, remembering the ids.
+    """
     path = ALLOCATION_PATH.format(activity=activity.id, user=student.id)
     ids = self.remembered(path)
     if ids:
-        return [document.resource for document in activity.fbf.get_many(
-            [(f"v1/assignments/allocations/{id}", {}) for id in ids])]
+        try:
+            return [document.resource for document in activity.fbf.get_many(
+                [(f"v1/assignments/allocations/{id}", {}) for id in ids])]
+        except ERRORS:
+            self.cache.forget(path)
     mine = [allocation for allocation in activity.allocations
             if users & {review_module.person(allocation, "actor"),
                         review_module.person(allocation, "allocable")}]
@@ -907,8 +925,9 @@ Both come from the allocations of the review task, the student being the
 The fetchers of \cref{Reviews} take a test of the allocations to keep, so
 we pass one for each and pay only for the student's allocations, a handful
 of requests instead of hundreds.
-The list of allocations itself they take from the [[Activity]], which
-fetches it once for all students.
+The allocations themselves the viewer gives them: those of the student
+fetched by their remembered ids, or the [[Activity]]'s list, which it
+fetches once for all students (\cref{ViewStudent}).
 The four fetches, reviews and feedback for each direction, do not depend on
 one another, so they run at the same time, as the parts do
 (\cref{ViewTogether}).
@@ -1125,7 +1144,8 @@ the student said about others, and the student's own words.
 When the student is looked for, the viewer fetches the activity's lists at
 the same time ([[prefetch]]): the progresses, if finding the student needs
 them (\cref{ViewStudent}), and those of the parts the activity has, the
-work handed in, the allocations and the reflections.
+work handed in, the allocations, unless the student's are remembered, and
+the reflections.
 Fetched one after the other, by whoever needs them first, they were a
 chain of round trips; together they cost one.
 A list that fails here is left to its part, which asks again and reports
@@ -1511,6 +1531,10 @@ class FBFHandler(MediaHandler):
   def do_GET(self):
     parts = urllib.parse.urlsplit(self.path)
     self.server.asked.append(parts.path)
+    together = getattr(self.server, "together", None)
+    if together and re.fullmatch(r"/v1/assignments/allocations/a\d",
+                                 parts.path):
+      together.wait()
     query = dict(urllib.parse.parse_qsl(parts.query))
     world = self.server.world
     for path in (parts.path.lstrip("/"), parts.path):
@@ -1551,14 +1575,16 @@ def real_links(value):
 def real_world(url):
   """The world of the viewer's tests, with FBF's real link shapes."""
   served = world(url)
+  served.documents["/t1/allocations"]["data"].append(
+    allocation("a4", "u1", "u3", reviews=0, ratings=0))
   served.documents = {real_link(path): real_links(document)
                       for path, document in served.documents.items()}
   for progress in served.documents["v1/progresses"]["data"]:
     served.documents[f"v1/progresses/{progress['id']}"] = {"data": progress}
-  for allocation in served.documents[
+  for pair in served.documents[
       "/v1/assignments/tasks/t1/allocations"]["data"]:
-    served.documents[f"v1/assignments/allocations/{allocation['id']}"] = \
-      {"data": allocation}
+    served.documents[f"v1/assignments/allocations/{pair['id']}"] = \
+      {"data": pair}
   return served
 
 def test_a_second_run_needs_no_launch_and_no_request(fbf_server, tmp_path,
@@ -1617,7 +1643,9 @@ def test_a_student_seen_before_costs_no_list_of_progresses(
       entry["fetched"] -= cache_module.LIST_TTL + 1
   cache_module.save_cache(kept, "canvas.example", "token", path)
   server.asked.clear()
+  server.together = threading.Barrier(3, timeout=5)
   assert run(tmp_path / "two") == first
+  server.together = None
   assert "/v1/progresses" not in server.asked
   assert sorted(p for p in server.asked if p.startswith("/v1/progresses/")) \
     == ["/v1/progresses/p2", "/v1/progresses/p3"]
@@ -1626,6 +1654,57 @@ def test_a_student_seen_before_costs_no_list_of_progresses(
                 if p.startswith("/v1/assignments/allocations/")
                 and p.count("/") == 4) \
     == [f"/v1/assignments/allocations/{a}" for a in ("a1", "a2", "a3")]
+  kept = cache_module.load_cache("canvas.example", "token", path=path)
+  for entry in kept.entries.values():
+    if entry["path"].startswith("fbf/allocation-ids/"):
+      entry["fetched"] -= 24 * 60 * 60 + 1
+  cache_module.save_cache(kept, "canvas.example", "token", path)
+  server.asked.clear()
+  assert run(tmp_path / "three") == first
+  assert "/v1/assignments/tasks/t1/allocations" in server.asked
+@
+
+The test above ends a day later, when the remembered allocations have
+expired and the list must be read again; the day is written out, not taken
+from the constant, so that a longer time would fail it.
+
+An allocation removed after its id was remembered cannot be fetched by
+it.
+The view must then read the list again and show both directions of the
+reviews, as if nothing had been remembered.
+
+<<test functions>>=
+def test_a_removed_allocation_makes_the_view_read_the_list(
+    fbf_server, tmp_path, memory_keyring, personal_data_allowed):
+  server, url = fbf_server
+  server.world = real_world(url)
+  connect = lambda assignments: FBF(FBFLogin("a", "r", url,
+                                             course_uuid="c"))
+  opened = fbf_assignment(1, "opened")
+  canvas = SimpleNamespace(get_course=lambda id: Course([opened], STUDENTS))
+  path = tmp_path / "fbf.cache"
+  def run(workdir):
+    viewer = Viewer(canvas, "canvas.example", "token", connect=connect,
+                    cache_path=path)
+    sections = view(viewer, opened, 2, workdir, score=8.0)
+    viewer.close()
+    return {section.title: section.body for section in sections}
+  run(tmp_path / "one")
+  documents = server.world.documents
+  del documents["v1/assignments/allocations/a1"]
+  listing = documents["/v1/assignments/tasks/t1/allocations"]["data"]
+  listing[:] = [a for a in listing if a["id"] != "a1"]
+  kept = cache_module.load_cache("canvas.example", "token", path=path)
+  for entry in kept.entries.values():
+    if cache_module.policy_of(entry["path"]).ttl == cache_module.LIST_TTL:
+      entry["fetched"] -= cache_module.LIST_TTL + 1
+  cache_module.save_cache(kept, "canvas.example", "token", path)
+  server.asked.clear()
+  second = run(tmp_path / "two")
+  assert not any(body.startswith("Could not") for body in second.values())
+  assert second[RECEIVED_TITLE].splitlines()[0] == "- Cy"
+  assert GIVEN_TITLE in second
+  assert "/v1/assignments/tasks/t1/allocations" in server.asked
 @
 
 With [[refresh]] the next run takes nothing from the first: it launches
