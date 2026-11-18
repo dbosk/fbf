@@ -123,18 +123,42 @@ import functools
 from fbf.api import FBF
 from fbf.launch import launch
 <<functions>>=
-def connect(canvas_url, canvas_token, assignments):
+def connect(canvas_url, canvas_token, assignments, cache=None):
     """Launch FBF through the safest of `assignments`; return an `FBF`.
 
     The `assignments` should be of one Canvas course; the client's
     `login.course_uuid` is then that course's FBF course.  Returns `None`
-    if none of `assignments` is an FBF assignment.
+    if none of `assignments` is an FBF assignment.  `cache`, if given, is
+    the client's cache (see `fbf.cache`).
     """
     for assignment in launch_order(assignments):
         relaunch = functools.partial(launch, canvas_url, canvas_token,
                                      assignment.course_id, assignment.id)
-        return FBF(relaunch(), relaunch=relaunch)
+        return FBF(relaunch(), relaunch=relaunch, cache=cache)
     return None
+@
+
+The commands' clients get the cache through [[fbf_activities]]
+(\cref{Cache}).
+Let's verify that the client it yields has it, with a stand-in for the
+launch, which needs Canvas, and the course's activities already in the
+cache, so that no request is sent.
+
+<<test functions>>=
+from fbf.cache import Cache
+from fbf.launch import FBFLogin
+
+def test_the_clients_of_the_commands_get_the_cache(monkeypatch):
+  monkeypatch.setattr("fbf.canvas.launch", lambda *args: FBFLogin(
+    "a", "r", "https://api.example", course_uuid="c"))
+  cache = Cache()
+  cache.store("v1/courses/c/activities", {"include": "placement"},
+              {"data": []})
+  opened = fbf_assignment("code", submitted=True)
+  opened.id, opened.course_id = 1, 5
+  (assignment, fbf, activity), = fbf_activities("https://canvas.example",
+                                                "token", [opened], cache)
+  assert fbf.cache is cache and activity is None
 @
 
 
@@ -220,18 +244,18 @@ can say so.
 <<imports>>=
 import itertools
 <<functions>>=
-def fbf_activities(canvas_url, canvas_token, assignments):
+def fbf_activities(canvas_url, canvas_token, assignments, cache=None):
     """Yield `(assignment, fbf, activity_id)` for the FBF `assignments`.
 
     `activity_id` is `None` when the assignment has not been opened in FBF
-    in its course round.
+    in its course round.  `cache`, if given, is the clients' cache.
     """
     by_course = lambda a: a.course_id
     fbf_assignments = sorted((a for a in assignments if placement_code(a)),
                              key=by_course)
     for _, course in itertools.groupby(fbf_assignments, key=by_course):
         course = list(course)
-        fbf = connect(canvas_url, canvas_token, course)
+        fbf = connect(canvas_url, canvas_token, course, cache)
         codes = activities_by_code(fbf, fbf.login.course_uuid)
         for assignment in course:
             yield assignment, fbf, codes.get(placement_code(assignment))

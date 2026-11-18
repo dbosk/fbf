@@ -566,7 +566,7 @@ def discussions_command(config, canvas, args):
     threads = []
     for assignment, fbf, activity in fbfcanvas.fbf_activities(
             canvaslms.cli.cache.normalize_hostname(hostname), token,
-            assignments):
+            assignments, getattr(args, "fbf_cache", None)):
         if activity:
             threads += activity_threads(fbf, activity, labels[assignment.id])
         else:

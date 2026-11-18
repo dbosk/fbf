@@ -67,6 +67,11 @@ FBF work behind a submission of an FBF assignment: the files the student
 handed in, the grade breakdown, the reviews received and given, the
 reflection and the discussion posts (`--no-fbf` turns it off).
 
+What fbf fetches is kept between runs, encrypted, in your cache directory,
+and the FeedbackFruits tokens in your system keyring: lists for five
+minutes, the rest for a week, so a second look is nearly instant.
+`canvaslms --refresh-cache` fetches everything again.
+
 ## When FeedbackFruits changes
 
 When FBF changes its API, the commands stop with an error that names what

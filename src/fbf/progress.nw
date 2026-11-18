@@ -1140,7 +1140,8 @@ def progress_command(config, canvas, args):
     hostname, token = canvaslms.cli.login.load_credentials(config)
     show_progress(collect_progress(canvas, fbfcanvas.fbf_activities(
         canvaslms.cli.cache.normalize_hostname(hostname), token,
-        assignments), fbfcanvas.assignment_labels(assignments)), args)
+        assignments, getattr(args, "fbf_cache", None)),
+        fbfcanvas.assignment_labels(assignments)), args)
 @
 
 [[collect_progress]] keeps the caches of [[assignment_progress]] for the

@@ -29,6 +29,14 @@ Literate programs (noweb). Edit the `.nw` files, never the tangled `.py`/`.tex`
   `media.<region>.feedbackfruits.com/<id>/<name>.<type>`, no token needed),
   grade, reviews got/given, reflection, posts. Filters before fetching
   (`keep=` on the review fetchers); `ERRORS` is what canvaslms reports.
+- `src/fbf/cache.nw`: cache between runs. `Cache` under `FBF.get` and
+  `get_by_ids` (per id), policy table by path: lists 5 min, details
+  `DEFAULT_CACHE_TTL_DAYS`, review/rating lists validated by the allocation's
+  counts and published-at (`list_marks`); unknown paths never cached.
+  Encrypted JSON file `fbf-<host>.cache` (key `derive_key`), personal entries
+  dropped under `cache.exclude: personal`; tokens in keyring service `fbf`.
+  Tests never touch the real keyring (`memory_keyring` fixture) or cache dir
+  (`cache_path=`).
 - `src/fbf/cli.nw`: standalone `fbf` and `add_command(subp)` for canvaslms;
   commands follow canvaslms's `(config, canvas, args)` convention.
 - `src/fbf/har.nw`: `har-shape`/`har-diff`: value-free shapes of HAR captures;

@@ -10,6 +10,7 @@ SHELL=		/bin/bash
 MODULES+=	init.nw
 MODULES+=	launch.nw
 MODULES+=	api.nw
+MODULES+=	cache.nw
 MODULES+=	har.nw
 MODULES+=	schema.nw
 MODULES+=	canvas.nw

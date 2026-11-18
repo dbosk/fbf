@@ -79,7 +79,8 @@ requires("submission-review-view-tasks",
          attributes=["reviewer-feedback-enabled"])
 requires("reflect-tasks", relationships=["reflections"])
 requires("assignments/allocation",
-         attributes=["reviews-count", "ratings-count"],
+         attributes=["reviews-count", "ratings-count",
+                     "reviews-published-at", "ratings-published-at"],
          relationships=["actor", "allocable", "reviews", "ratings",
                         "reviewer-feedback"])
 for kind in ["assignments/criterion", "assignments/rubric-criterion"]:
@@ -640,8 +641,21 @@ the reviews and the ratings share one pool of requests rather than waiting
 for each other.
 The [[wanted]] map gives, for each relationship, the test of whether an
 allocation has anything there.
+Each request carries the allocation's counts and publication times as the
+validator of a cached list (\cref{Cache}): a list kept from an earlier run
+is used only if the allocation still says the same, so a new or
+republished review is fetched at once.
 
+<<constants>>=
+LIST_MARKS = ["reviews-count", "ratings-count", "reviews-published-at",
+              "ratings-published-at"]
 <<functions>>=
+def list_marks(allocation):
+    """Return what an allocation says about its lists, as a validator."""
+    attributes = allocation.get("attributes") or {}
+    return [attributes.get(name) for name in LIST_MARKS]
+
+
 def allocation_lists(fbf, allocations, wanted):
     """Return the resources of the relationships `wanted` of `allocations`.
 
@@ -651,7 +665,10 @@ def allocation_lists(fbf, allocations, wanted):
     asked = [(name, related_link(allocation, name))
              for allocation in allocations
              for name, has_any in wanted.items() if has_any(allocation)]
-    documents = fbf.get_many([(link, {}) for _, link in asked])
+    marks = [list_marks(allocation) for allocation in allocations
+             for name, has_any in wanted.items() if has_any(allocation)]
+    documents = fbf.get_many([(link, {}, mark)
+                              for (_, link), mark in zip(asked, marks)])
     lists = {name: [] for name in wanted}
     for (name, _), document in zip(asked, documents):
         lists[name] += document.resources
@@ -980,7 +997,7 @@ class FakeFBF:
     return Document(self.documents.get(path, {"data": []}))
 
   def get_many(self, requests):
-    return [self.get(path, **params) for path, params in requests]
+    return [self.get(path, **params) for path, params, *_ in requests]
 
   def get_by_ids(self, path, ids):
     self.asked.append(path)
@@ -991,6 +1008,42 @@ class FakeFBF:
 The first question is which lists we ask for.
 An allocation whose counts are zero must cost no request, whatever the
 relationship.
+
+With a cache (\cref{Cache}), a list kept from before must be used only
+while its allocation says the same.
+Here the client and the cache are the real ones and only the session is
+made up, logging what it is asked; a new count or publication time on the
+allocation must make the list be fetched again.
+
+<<test functions>>=
+from types import SimpleNamespace
+from fbf.api import FBF
+from fbf.cache import Cache
+
+def test_a_kept_list_is_fetched_again_when_its_allocation_changes():
+  asked = []
+  class Session:
+    def request(self, method, url, headers=None, params=None, **kwargs):
+      asked.append(url)
+      return SimpleNamespace(status_code=200, ok=True,
+                             json=lambda: {"data": []})
+  login = SimpleNamespace(access_token="t", refresh_token=None,
+                          api_url="https://api.example")
+  fbf = FBF(login, session=Session(), cache=Cache())
+  pair = allocation("a1", reviews=1, ratings=0)
+  pair["relationships"]["reviews"]["links"]["related"] = \
+    "https://api.example/v1/assignments/allocations/a1/reviews"
+  wanted = {"reviews": counted("reviews-count")}
+  allocation_lists(fbf, [pair], wanted)
+  allocation_lists(fbf, [pair], wanted)
+  assert len(asked) == 1
+  pair["attributes"]["reviews-count"] = 2
+  allocation_lists(fbf, [pair], wanted)
+  assert len(asked) == 2
+  pair["attributes"]["reviews-published-at"] = "2026-11-18T10:00:00Z"
+  allocation_lists(fbf, [pair], wanted)
+  assert len(asked) == 3
+@
 
 <<test functions>>=
 def test_allocation_lists_asks_only_allocations_with_something():
@@ -1246,7 +1299,7 @@ def reviews_command(config, canvas, args):
     items = []
     for assignment, fbf, activity in fbfcanvas.fbf_activities(
             canvaslms.cli.cache.normalize_hostname(hostname), token,
-            assignments):
+            assignments, getattr(args, "fbf_cache", None)):
         label = labels[assignment.id]
         try:
             items += activity_items(fbf, activity, label, args)
