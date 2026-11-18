@@ -484,6 +484,16 @@ So the viewer remembers them, in the cache file under paths of its own
 other details and as personal as the rest.
 A view of a student seen before then fetches the student's progress by
 its id, and never the list.
+The same holds for the allocations of the review task, the slowest list
+once the progresses were gone: 0.7 to 1.2 seconds for 261 allocations, of
+which a student has some four, against 0.07 seconds for one by its id.
+FBF ignores [[filter[actor]]] and [[filter[allocable]]] on the list, which
+we checked, so we cannot ask it for the student's share.
+We remember the ids of the student's allocations instead and fetch those,
+together.
+Unlike the progresses, a student's allocations can change as a whole: a
+teacher may reallocate the reviews, so we remember them for a day only
+(\cref{Cache}), after which the next view reads the list again.
 The progresses taken from the list are also kept as the answers to those
 requests by id, so a view within five minutes asks for nothing.
 What it may miss is a second identity created in FBF since, until the
@@ -492,12 +502,16 @@ details expire or [[--refresh-cache]].
 <<constants>>=
 STUDENT_PATH = "fbf/students/{course}/{user}"
 PROGRESS_PATH = "fbf/progress-ids/{activity}/{user}"
+ALLOCATION_PATH = "fbf/allocation-ids/{activity}/{user}"
 <<viewer methods>>=
 def users_of(self, activity, course_id, student):
     """Return the ids of the FBF users who are `student`, remembered."""
     path = STUDENT_PATH.format(course=course_id, user=student.id)
     known = self.remembered(path)
-    self.prefetch(activity, progresses=not known)
+    allocations = self.remembered(
+        ALLOCATION_PATH.format(activity=activity.id, user=student.id))
+    self.prefetch(activity, progresses=not known,
+                  allocations=not allocations)
     if known:
         return set(known)
     users = student_users(activity.fbf, activity.users, student, self.emails)
@@ -519,6 +533,23 @@ def progresses_of(self, activity, users, student):
     for progress in mine:
         self.cache.store(f"v1/progresses/{progress['id']}", {},
                          {"data": progress})
+    return mine
+
+def allocations_of(self, activity, users, student):
+    """Return the allocations of `users` in `activity`, by remembered ids."""
+    path = ALLOCATION_PATH.format(activity=activity.id, user=student.id)
+    ids = self.remembered(path)
+    if ids:
+        return [document.resource for document in activity.fbf.get_many(
+            [(f"v1/assignments/allocations/{id}", {}) for id in ids])]
+    mine = [allocation for allocation in activity.allocations
+            if users & {review_module.person(allocation, "actor"),
+                        review_module.person(allocation, "allocable")}]
+    if mine:
+        self.remember(path, [allocation["id"] for allocation in mine])
+    for allocation in mine:
+        self.cache.store(f"v1/assignments/allocations/{allocation['id']}",
+                         {}, {"data": allocation})
     return mine
 
 def remembered(self, path):
@@ -890,11 +921,15 @@ GIVEN_TITLE = "Reviews given"
 <<imports>>=
 from fbf import reviews as review_module
 <<functions>>=
-def review_sections(activity, users):
-    """Return the `Section`s of the reviews that `users` got and gave."""
+def review_sections(activity, users, allocations=None):
+    """Return the `Section`s of the reviews that `users` got and gave.
+
+    `allocations`, if given, are those to read; else the activity's.
+    """
     roles = [(RECEIVED_TITLE, "allocable", "reviewer"),
              (GIVEN_TITLE, "actor", "reviewee")]
-    allocations = activity.allocations
+    if allocations is None:
+        allocations = activity.allocations
     with concurrent.futures.ThreadPoolExecutor(2 * len(roles)) as pool:
         fetched = [(title, other,
                     pool.submit(review_module.fetch_reviews, activity.fbf,
@@ -1101,13 +1136,14 @@ PREFETCHED = [("submissions", SUBMIT_TASK),
               ("allocations", review_module.REVIEW_TASK),
               ("reflections", review_module.REFLECT_TASK)]
 <<viewer methods>>=
-def prefetch(self, activity, progresses=True):
+def prefetch(self, activity, progresses=True, allocations=True):
     """Fetch the lists of `activity` that the view will read, together.
 
-    The progresses only if `progresses`.
+    The progresses only if `progresses`, the allocations if `allocations`.
     """
     names = ["progresses"] if progresses else []
-    names += [name for name, task in PREFETCHED if task in activity.task]
+    names += [name for name, task in PREFETCHED if task in activity.task
+              and (allocations or name != "allocations")]
     def fetch(name):
         try:
             getattr(activity, name)
@@ -1200,7 +1236,8 @@ sections, guarded by whether the activity has the task.
                          submission.score,
                          self.progresses_of(activity, users, student))]),
  (RECEIVED_TITLE, review_module.REVIEW_TASK in activity.task,
-  lambda: review_sections(activity, users)),
+  lambda: review_sections(activity, users,
+                          self.allocations_of(activity, users, student))),
  (REFLECTION_TITLE, review_module.REFLECT_TASK in activity.task,
   lambda: [reflection_section(activity, users)]),
  (DISCUSSION_TITLE, MULTIMEDIA_TASK in activity.task,
@@ -1518,6 +1555,10 @@ def real_world(url):
                       for path, document in served.documents.items()}
   for progress in served.documents["v1/progresses"]["data"]:
     served.documents[f"v1/progresses/{progress['id']}"] = {"data": progress}
+  for allocation in served.documents[
+      "/v1/assignments/tasks/t1/allocations"]["data"]:
+    served.documents[f"v1/assignments/allocations/{allocation['id']}"] = \
+      {"data": allocation}
   return served
 
 def test_a_second_run_needs_no_launch_and_no_request(fbf_server, tmp_path,
@@ -1548,9 +1589,9 @@ def test_a_second_run_needs_no_launch_and_no_request(fbf_server, tmp_path,
 @
 
 Once the lists are older than five minutes, the next run asks for them
-again, but not for the slow list of all progresses: it remembers which
-users and progresses are the student's (\cref{ViewStudent}) and asks for
-those progresses by id.
+again, but not for the slow lists of all progresses and all allocations:
+it remembers which users, progresses and allocations are the student's
+(\cref{ViewStudent}) and asks for those by id.
 We age the kept lists in the file rather than wait.
 
 <<test functions>>=
@@ -1580,6 +1621,11 @@ def test_a_student_seen_before_costs_no_list_of_progresses(
   assert "/v1/progresses" not in server.asked
   assert sorted(p for p in server.asked if p.startswith("/v1/progresses/")) \
     == ["/v1/progresses/p2", "/v1/progresses/p3"]
+  assert "/v1/assignments/tasks/t1/allocations" not in server.asked
+  assert sorted(p for p in server.asked
+                if p.startswith("/v1/assignments/allocations/")
+                and p.count("/") == 4) \
+    == [f"/v1/assignments/allocations/{a}" for a in ("a1", "a2", "a3")]
 @
 
 With [[refresh]] the next run takes nothing from the first: it launches

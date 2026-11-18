@@ -83,6 +83,7 @@ from canvaslms.hacks.canvasapi import DEFAULT_CACHE_TTL_DAYS
 <<constants>>=
 LIST_TTL = 5 * 60
 DETAIL_TTL = DEFAULT_CACHE_TTL_DAYS * 24 * 60 * 60
+ALLOCATION_IDS_TTL = 24 * 60 * 60
 <<classes>>=
 @dataclasses.dataclass(frozen=True)
 class Policy:
@@ -111,7 +112,11 @@ So is what the viewer learns about a student, under [[fbf/]]
 (\cref{ViewStudent}): which FBF users are the student, and which
 progresses theirs.
 A participant's progress fetched by its id is as changing as the list of
-all of them, so it is a list too.
+all of them, so it is a list too, and so is an allocation fetched by its
+id.
+Which allocations are a student's is kept for a day only, not a week: a
+teacher may reallocate the reviews, and a remembered set would not show
+the new ones (\cref{ViewStudent}).
 
 <<constants>>=
 POLICIES = [
@@ -131,6 +136,8 @@ POLICIES = [
     Policy(r"/(reviews|ratings)$", DETAIL_TTL, True),
     Policy(r"^media/[^/]+$", DETAIL_TTL, True),
     Policy(r"^v1/progresses/[^/]+$", LIST_TTL, True),
+    Policy(r"^v1/assignments/allocations/[^/]+$", LIST_TTL, True),
+    Policy(r"^fbf/allocation-ids/", ALLOCATION_IDS_TTL, True),
     Policy(r"^fbf/", DETAIL_TTL, True),
 ]
 <<imports>>=
@@ -165,6 +172,8 @@ def test_policies_classify_the_paths_we_fetch():
   assert policy_of("v1/courses/c/activities").ttl == DETAIL_TTL
   assert policy_of("v1/progresses/p1").ttl == LIST_TTL
   assert policy_of("fbf/students/5/2").personal is True
+  assert policy_of("v1/assignments/allocations/a1").ttl == LIST_TTL
+  assert policy_of("fbf/allocation-ids/act/2").ttl == ALLOCATION_IDS_TTL
   assert policy_of("v1/people/u1/emails").personal is True
   assert policy_of("v1/users").personal is True
   assert policy_of(api + "v1/assignments/allocations/a1/reviews").personal
