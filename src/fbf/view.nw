@@ -225,6 +225,7 @@ class Viewer:
                       else cache_module.Cache(refresh=refresh))
         self.client = None
         self.asked_again = set()
+        self.by_id = {}
         self.courses = {}
         self.activities = {}
         self.students = {}
@@ -501,6 +502,38 @@ remembered ids are forgotten and the list is read, so a removal costs a
 slower view, not a broken one.
 A student without allocations is not remembered as such, since an empty
 set would hide allocations made later; such a student costs the list.
+
+\subsubsection{Many students at once}
+
+Fetching by id pays off for a few students, not for many: each student
+costs a request per progress and per allocation.
+We timed 20 students of one activity in one run, with the lists expired:
+4.9~seconds, 135 requests, most of them allocations and progresses by id,
+although one student unknown to the cache had already brought both whole
+lists into memory.
+A whole list costs about a second once, for all students; by id costs
+0.1 to 0.17 seconds per student for the allocations and 0.05 for the
+progress.
+So for each activity the viewer reads a whole list instead whenever it is
+free, that is fresh in the cache, as a list fetched earlier in the run is,
+and as soon as it has served [[BULK_AFTER]] students of the activity by
+id: five for
+the allocations, where the list pays off after six to ten students, and
+twenty for the progresses, where it pays off after about twenty.
+Reading the list also remembers each student's ids anew, so a run over a
+whole assignment brings the remembered allocations up to date, newly
+added ones included.
+
+<<constants>>=
+BULK_AFTER = {"progresses": 20, "allocations": 5}
+LIST_REQUESTS = {
+    "progresses": lambda activity: ("v1/progresses",
+                                    {"activity_id": activity.id}),
+    "allocations": lambda activity: (
+        related_link(activity.task[review_module.REVIEW_TASK],
+                     "allocations"), {}),
+}
+@
 The progresses taken from the list are also kept as the answers to those
 requests by id, so a view within five minutes asks for nothing.
 What it may miss is a second identity created in FBF since, until the
@@ -512,29 +545,52 @@ PROGRESS_PATH = "fbf/progress-ids/{activity}/{user}"
 ALLOCATION_PATH = "fbf/allocation-ids/{activity}/{user}"
 <<viewer methods>>=
 def users_of(self, activity, course_id, student):
-    """Return the ids of the FBF users who are `student`, remembered.
+    """Return the FBF users who are `student`, and which lists to read.
 
-    It starts the prefetch of the activity's lists, leaving out those
-    that what is remembered about `student` makes unnecessary.
+    The users are remembered.  The second value says, per list
+    (`progresses`, `allocations`), whether this view reads the
+    activity's whole list rather than the student's share by id; the
+    prefetch of the activity's lists is started accordingly.
     """
     path = STUDENT_PATH.format(course=course_id, user=student.id)
     known = self.remembered(path)
-    allocations = self.remembered(
-        ALLOCATION_PATH.format(activity=activity.id, user=student.id))
-    self.prefetch(activity, progresses=not known,
-                  allocations=not allocations)
+    whole = self.lists_to_read(activity, student, bool(known))
+    self.prefetch(activity, progresses=whole["progresses"],
+                  allocations=whole["allocations"])
     if known:
-        return set(known)
+        return set(known), whole
     users = student_users(activity.fbf, activity.users, student, self.emails)
     if users:
         self.remember(path, sorted(users))
-    return users
+    return users, whole
 
-def progresses_of(self, activity, users, student):
-    """Return the progresses of `users` in `activity`, by remembered ids."""
+def lists_to_read(self, activity, student, users_known):
+    """Decide, per list, whether this view reads the activity's whole list."""
+    progresses = self.remembered(
+        PROGRESS_PATH.format(activity=activity.id, user=student.id))
+    allocations = self.remembered(
+        ALLOCATION_PATH.format(activity=activity.id, user=student.id))
+    return {"progresses": not (users_known and progresses)
+                          or self.in_bulk(activity, "progresses"),
+            "allocations": not allocations
+                           or self.in_bulk(activity, "allocations")}
+
+def in_bulk(self, activity, name):
+    """Whether to read the list `name` of `activity` whole from now on."""
+    if self.cache.fresh(*LIST_REQUESTS[name](activity)):
+        return True
+    key = (activity.id, name)
+    self.by_id[key] = self.by_id.get(key, 0) + 1
+    return self.by_id[key] > BULK_AFTER[name]
+
+def progresses_of(self, activity, users, student, whole=False):
+    """Return the progresses of `users` in `activity`.
+
+    By remembered ids, unless `whole` says to read the activity's list.
+    """
     path = PROGRESS_PATH.format(activity=activity.id, user=student.id)
     ids = self.remembered(path)
-    if ids:
+    if ids and not whole:
         return [activity.fbf.get(f"v1/progresses/{id}").resource
                 for id in ids]
     mine = [progress for progress in activity.progresses
@@ -546,15 +602,16 @@ def progresses_of(self, activity, users, student):
                          {"data": progress})
     return mine
 
-def allocations_of(self, activity, users, student):
+def allocations_of(self, activity, users, student, whole=False):
     """Return the allocations of `student`, who is `users`, in `activity`.
 
-    By the ids remembered for `student` if there are any and they can all
-    be fetched; else from the activity's list, remembering the ids.
+    By the ids remembered for `student` if there are any, `whole` does not
+    say to read the activity's list, and they can all be fetched; else
+    from the activity's list, remembering the ids.
     """
     path = ALLOCATION_PATH.format(activity=activity.id, user=student.id)
     ids = self.remembered(path)
-    if ids:
+    if ids and not whole:
         try:
             return [document.resource for document in activity.fbf.get_many(
                 [(f"v1/assignments/allocations/{id}", {}) for id in ids])]
@@ -1239,7 +1296,7 @@ def sections(self, submission, workdir):
     student = self.student(assignment.course_id, submission.user_id)
     if student is None:
         return [Section(WORK_TITLE, NOT_A_STUDENT)]
-    users = self.users_of(activity, assignment.course_id, student)
+    users, whole = self.users_of(activity, assignment.course_id, student)
     if not users:
         return [Section(WORK_TITLE, NOT_TAKEN_PART)]
     return each_part(<<the parts of [[activity]]>>)
@@ -1254,10 +1311,12 @@ sections, guarded by whether the activity has the task.
  (GRADE_TITLE, True,
   lambda: [grade_section(activity, users, assignment, student,
                          submission.score,
-                         self.progresses_of(activity, users, student))]),
+                         self.progresses_of(activity, users, student,
+                                            whole["progresses"]))]),
  (RECEIVED_TITLE, review_module.REVIEW_TASK in activity.task,
   lambda: review_sections(activity, users,
-                          self.allocations_of(activity, users, student))),
+                          self.allocations_of(activity, users, student,
+                                              whole["allocations"]))),
  (REFLECTION_TITLE, review_module.REFLECT_TASK in activity.task,
   lambda: [reflection_section(activity, users)]),
  (DISCUSSION_TITLE, MULTIMEDIA_TASK in activity.task,
@@ -1705,6 +1764,68 @@ def test_a_removed_allocation_makes_the_view_read_the_list(
   assert second[RECEIVED_TITLE].splitlines()[0] == "- Cy"
   assert GIVEN_TITLE in second
   assert "/v1/assignments/tasks/t1/allocations" in server.asked
+@
+
+For many students the whole lists win (\cref{ViewStudent}).
+A student the cache does not know brings the activity's lists into memory,
+and a remembered student viewed after that in the same run uses them: no
+progress and no allocation is then fetched by id.
+And once [[BULK_AFTER]] students of an activity were served by id, the
+next reads the list; we set the threshold to one, since the test world has
+two students who took part.
+
+<<test functions>>=
+def by_id(asked):
+  return [path for path in asked if re.fullmatch(
+    r"/v1/(progresses/p\d|assignments/allocations/a\d)", path)]
+
+def batch_run(server, url, tmp_path):
+  connect = lambda assignments: FBF(FBFLogin("a", "r", url,
+                                             course_uuid="c"))
+  opened = fbf_assignment(1, "opened")
+  canvas = SimpleNamespace(get_course=lambda id: Course([opened], STUDENTS))
+  path = tmp_path / "fbf.cache"
+  def run(*students):
+    viewer = Viewer(canvas, "canvas.example", "token", connect=connect,
+                    cache_path=path)
+    for student in students:
+      view(viewer, opened, student, tmp_path / str(student))
+    viewer.close()
+  def age():
+    kept = cache_module.load_cache("canvas.example", "token", path=path)
+    for entry in kept.entries.values():
+      if cache_module.policy_of(entry["path"]).ttl == cache_module.LIST_TTL:
+        entry["fetched"] -= cache_module.LIST_TTL + 1
+    cache_module.save_cache(kept, "canvas.example", "token", path)
+  return run, age
+
+def test_lists_in_memory_serve_remembered_students(
+    fbf_server, tmp_path, memory_keyring, personal_data_allowed):
+  server, url = fbf_server
+  server.world = real_world(url)
+  run, age = batch_run(server, url, tmp_path)
+  run(2)
+  age()
+  server.asked.clear()
+  run(1, 2)
+  assert by_id(server.asked) == []
+  assert server.asked.count("/v1/assignments/tasks/t1/allocations") == 1
+
+def test_many_students_switch_to_the_whole_list(
+    fbf_server, tmp_path, memory_keyring, personal_data_allowed,
+    monkeypatch):
+  monkeypatch.setitem(BULK_AFTER, "allocations", 1)
+  server, url = fbf_server
+  server.world = real_world(url)
+  run, age = batch_run(server, url, tmp_path)
+  run(2, 1)
+  age()
+  server.asked.clear()
+  run(2, 1)
+  allocations = [p for p in by_id(server.asked) if "allocations" in p]
+  assert sorted(allocations) \
+    == [f"/v1/assignments/allocations/{a}" for a in ("a1", "a2", "a3")]
+  assert server.asked.count("/v1/assignments/tasks/t1/allocations") == 1
 @
 
 With [[refresh]] the next run takes nothing from the first: it launches

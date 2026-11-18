@@ -192,6 +192,9 @@ It answers a request only while the policy's time has not run out and the
 validator is the same, and it hands out a copy, so that a caller who
 changes a document does not change the cache.
 The clock is a parameter, [[now]], so that the tests can move it.
+[[fresh]] answers whether the cache holds a usable document without
+copying it, for a caller that only decides which request to make
+(\cref{ViewStudent}).
 The fetchers call the cache from several threads (\cref{Parallel}), so a
 lock guards the dictionary.
 
@@ -241,6 +244,15 @@ def as_json(value):
 <<cache methods>>=
 def lookup(self, path, params, validator=None):
     """Return the cached document of a request, or `None`."""
+    entry = self.good_entry(path, params, validator)
+    return None if entry is None else copy.deepcopy(entry["document"])
+
+def fresh(self, path, params):
+    """Whether the cache would answer a request, without copying it."""
+    return self.good_entry(path, params) is not None
+
+def good_entry(self, path, params, validator=None):
+    """Return the entry of a request if it may still be used, or `None`."""
     policy = policy_of(path)
     if policy is None or self.refresh:
         return None
@@ -250,7 +262,7 @@ def lookup(self, path, params, validator=None):
         return None
     if entry["validator"] != as_json(validator):
         return None
-    return copy.deepcopy(entry["document"])
+    return entry
 
 def store(self, path, params, document, validator=None):
     """Keep the `document` of a request, if its path is cached.
@@ -300,7 +312,9 @@ DOCUMENT = {"data": [{"type": "progresses", "id": "p1"}]}
 def test_lists_live_five_minutes_and_details_days():
   clock = Clock()
   cache = Cache(now=clock)
+  assert not cache.fresh("v1/progresses", {"activity_id": "a"})
   cache.store("v1/progresses", {"activity_id": "a"}, DOCUMENT)
+  assert cache.fresh("v1/progresses", {"activity_id": "a"})
   cache.store("v1/activities/a", {"include": "tasks"}, DOCUMENT)
   clock.time += LIST_TTL - 1
   assert cache.lookup("v1/progresses", {"activity_id": "a"}) == DOCUMENT
