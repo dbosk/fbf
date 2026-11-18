@@ -62,6 +62,11 @@ Only assignments that someone has opened in FBF in this course round have
 data; the commands say which have none yet. One launch per Canvas course
 gives access to all of its FBF activities.
 
+With this package installed, `canvaslms submissions view` also shows the
+FBF work behind a submission of an FBF assignment: the files the student
+handed in, the grade breakdown, the reviews received and given, the
+reflection and the discussion posts (`--no-fbf` turns it off).
+
 ## When FeedbackFruits changes
 
 When FBF changes its API, the commands stop with an error that names what

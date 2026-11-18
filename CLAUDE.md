@@ -24,6 +24,11 @@ Literate programs (noweb). Edit the `.nw` files, never the tangled `.py`/`.tex`
   (facet points = weight × completion, sum = overall, sent grade =
   overall/100), checked against Canvas scores (`--mismatch`,
   `--unpublished`). FBF users map to Canvas by email.
+- `src/fbf/view.nw`: `fbf.view.Viewer` for `canvaslms submissions view`:
+  one student's work (handed-in files from the media service
+  `media.<region>.feedbackfruits.com/<id>/<name>.<type>`, no token needed),
+  grade, reviews got/given, reflection, posts. Filters before fetching
+  (`keep=` on the review fetchers); `ERRORS` is what canvaslms reports.
 - `src/fbf/cli.nw`: standalone `fbf` and `add_command(subp)` for canvaslms;
   commands follow canvaslms's `(config, canvas, args)` convention.
 - `src/fbf/har.nw`: `har-shape`/`har-diff`: value-free shapes of HAR captures;

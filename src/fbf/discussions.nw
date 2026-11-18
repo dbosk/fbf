@@ -143,6 +143,7 @@ class Post:
     upvotes: int = 0
     score: float = None
     replies: list = dataclasses.field(default_factory=list)
+    author_id: str = None
 
     def count(self):
         """Return the number of posts below this one."""
@@ -160,6 +161,11 @@ class Thread:
 
 The kind comes from the JSON:API type, in the singular and without the
 [[open-]] prefix, which is FBF's name for the question style.
+
+A post keeps its author's FBF user id, [[author_id]], beside the name.
+The listings show only the name, but the view of one student's submission
+(\cref{View}) must find that student's posts, and a name does not do: two
+students may share one.
 
 <<constants>>=
 CHOICE_QUESTIONS = ["multiple-choice-questions", "scratch-off-questions"]
@@ -188,7 +194,8 @@ def make_post(resource, users, replies=(), reply=False, choices=None):
                 upvotes=(0 if choice_answer
                          else attribute(resource, "upvotes-count") or 0),
                 score=attributes.get("score"),
-                replies=list(replies))
+                replies=list(replies),
+                author_id=related_id(resource, "user"))
 @
 
 A choice answer's text is the text of the choices made.
@@ -223,10 +230,10 @@ USERS = {"u1": {"type": "users", "id": "u1",
 
 def test_make_post_kinds_and_author():
   answer = make_post(resource("open-answers", "a", score=1.0), USERS)
-  assert (answer.kind, answer.author, answer.score) \
-    == ("answer", "Ada Student", 1.0)
+  assert (answer.kind, answer.author, answer.author_id, answer.score) \
+    == ("answer", "Ada Student", "u1", 1.0)
   reply = make_post(resource("comments", "c", user="gone"), USERS, reply=True)
-  assert (reply.kind, reply.author) == ("reply", "")
+  assert (reply.kind, reply.author, reply.author_id) == ("reply", "", "gone")
 
 def test_make_post_choice_answer_uses_choices():
   answer = {"type": "scratch-off-answers", "id": "a",

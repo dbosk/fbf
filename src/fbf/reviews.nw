@@ -674,16 +674,31 @@ allocations.
 We check the criteria and the people before the hundreds of requests for
 the lists, so that an activity we cannot read fails at once.
 
+Those hundreds of requests are the price of a whole activity.
+A caller that wants one student's part, such as the view of a single
+submission (\cref{View}), passes [[keep]], a test of the allocations to
+keep, and pays only for the few allocations that pass it.
+We filter the allocations rather than the finished reviews because the
+cost is in the lists behind the allocations: an allocation left out is a
+request not sent.
+FBF cannot do the filtering for us, since it has no filter for the
+allocations of one user, and an unknown filter is silently ignored.
+Such a caller also asks again for each student, so it may pass the
+activity's [[allocations]] that it fetched once, and the fetchers do not
+ask for them again.
+
 <<functions>>=
-def fetch_reviews(fbf, tasks, activity):
+def fetch_reviews(fbf, tasks, activity, keep=None, allocations=None):
     """Return the `Review`s of a peer-review activity with `tasks`.
 
-    `activity` labels the reviews.
+    `activity` labels the reviews.  `keep`, if given, is a test of the
+    allocations to include; the others cost no request.  `allocations`, if
+    given, are the review task's allocations, fetched before.
     """
     task = tasks[REVIEW_TASK]
     criteria = fbf.get(related_link(task, "criteria")).resources
     check_criteria(criteria)
-    allocations = fbf.get(related_link(task, "allocations")).resources
+    allocations = kept(task_allocations(fbf, tasks, allocations), keep)
     users = allocation_users(fbf, allocations)
     lists = allocation_lists(fbf, allocations,
                              {"reviews": counted("reviews-count"),
@@ -703,6 +718,19 @@ def allocation_users(fbf, allocations):
                           [person(allocation, name)
                            for allocation in allocations
                            for name in ("actor", "allocable")])
+
+
+def task_allocations(fbf, tasks, allocations=None):
+    """Return the review task's allocations: `allocations`, or fetched."""
+    if allocations is not None:
+        return allocations
+    return fbf.get(related_link(tasks[REVIEW_TASK], "allocations")).resources
+
+
+def kept(allocations, keep=None):
+    """Return the `allocations` that pass `keep`; all if `keep` is `None`."""
+    return list(allocations) if keep is None else [
+        allocation for allocation in allocations if keep(allocation)]
 @
 
 These functions talk to FBF, so their test needs a recording
@@ -781,12 +809,15 @@ def reviewed(allocation):
                 or attribute(allocation, "ratings-count"))
 
 
-def fetch_feedback(fbf, tasks, activity):
-    """Return the `Feedback` on the reviews of a peer-review activity."""
+def fetch_feedback(fbf, tasks, activity, keep=None, allocations=None):
+    """Return the `Feedback` on the reviews of a peer-review activity.
+
+    `keep`, if given, is a test of the allocations to include;
+    `allocations`, if given, the review task's allocations fetched before.
+    """
     if not feedback_enabled(tasks):
         return []
-    allocations = fbf.get(related_link(tasks[REVIEW_TASK],
-                                       "allocations")).resources
+    allocations = kept(task_allocations(fbf, tasks, allocations), keep)
     users = allocation_users(fbf, allocations)
     lists = allocation_lists(fbf, allocations,
                              {"reviewer-feedback": reviewed})
@@ -1067,6 +1098,27 @@ def test_fetch_feedback_end_to_end_and_only_when_enabled():
   off.asked.clear()
   assert fetch_feedback(off, tasks, "Essay") == []
   assert off.asked == []
+@
+
+With [[keep]] the fetchers ask only for the allocations it keeps.
+We keep Cy's allocations: Cy reviewed Ada, and Ada was to review Cy.
+Bo's review of Ada must be gone, and so must the requests for its lists.
+
+<<test functions>>=
+def involves(user):
+  return lambda allocation: user in (person(allocation, "actor"),
+                                     person(allocation, "allocable"))
+
+def test_keep_limits_the_fetchers_to_the_kept_allocations():
+  fbf = course_with_a_peer_review()
+  tasks = peer_review_tasks(fbf, "act")
+  result = fetch_reviews(fbf, tasks, "Essay", keep=involves("u3"))
+  assert [(r.reviewee, r.reviewer) for r in result] == [("Ada", "Cy")]
+  assert lists_asked(fbf) == ["/r/a2"]
+  fbf.asked.clear()
+  result = fetch_feedback(fbf, tasks, "Essay", keep=involves("u3"))
+  assert [(f.reviewee, f.reviewer) for f in result] == [("Ada", "Cy")]
+  assert lists_asked(fbf) == ["/f/a2"]
 @
 
 [[fetch_reflections]] must name the students, whom the reflections give
