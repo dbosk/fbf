@@ -1,6 +1,6 @@
 [project]
 name = "FeedbackFruits"
-version = "0.1"
+version = "0.2"
 description = "Detailed FeedbackFruits data (peer reviews, grade breakdowns, discussions) through the Canvas LTI launch"
 authors = [
   {name = "Daniel Bosk", email = "daniel@bosk.se"}
